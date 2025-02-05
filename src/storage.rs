@@ -137,15 +137,14 @@ impl Storage {
                 let path = entry.path();
 
                 if path.is_dir() {
-                    // TODO: optimize memory allocations
-                    let mut buf: Vec<u8> = vec![];
+                    let id = path
+                        .file_name()
+                        .expect("bug? unknown container path")
+                        .to_str()
+                        .expect("bug? container name has invalid chars")
+                        .to_string();
 
-                    let mut file = File::open(path.join("spec.bin"))
-                        .context(format!("opening spec at {:?}", &path))?;
-                    file.read_to_end(&mut buf)?;
-
-                    let config: ContainerConfig = prost::Message::decode(&buf[..])
-                        .context(format!("decode container {:?}", &path))?;
+                    let config = self.get_container(&id)?;
 
                     let mut state = ContainerState::ContainerCreated;
 
@@ -162,12 +161,7 @@ impl Storage {
                     let image = config.image.clone();
 
                     let container = Container {
-                        id: path
-                            .file_name()
-                            .expect("bug? unknown container path")
-                            .to_str()
-                            .expect("bug? container name has invalid chars")
-                            .to_string(),
+                        id,
                         image: image.clone(),
                         state: state.into(),
                         created_at: to_timestamp(created)?,
@@ -205,7 +199,25 @@ impl Storage {
         let mut file = File::create(root.join("spec.bin"))?;
         file.write_all(&buf)?;
 
+        fs::create_dir_all(self.build_container_path(&id).join("mounts"))?;
+
         Ok(id)
+    }
+
+    pub fn get_container(&self, id: &String) -> Result<ContainerConfig, anyhow::Error> {
+        let path = self.containers.join(id);
+
+        // TODO: optimize memory allocations
+        let mut buf: Vec<u8> = vec![];
+
+        let mut file =
+            File::open(path.join("spec.bin")).context(format!("opening spec at {:?}", &path))?;
+        file.read_to_end(&mut buf)?;
+
+        let config: ContainerConfig =
+            prost::Message::decode(&buf[..]).context(format!("decode container {:?}", &path))?;
+
+        Ok(config)
     }
 
     /// check whether the layer exists
@@ -244,11 +256,7 @@ impl Storage {
     ) -> Result<bool, anyhow::Error> {
         let mut exists = false;
 
-        let root = self
-            .images
-            .join(&image.domain)
-            .join(&image.repository)
-            .join("layers");
+        let root = self.build_image_layers_path(&image);
 
         if root.exists() {
             exists = true;
@@ -271,6 +279,53 @@ impl Storage {
         fs::create_dir_all(&self.images)?;
 
         Ok(())
+    }
+
+    // get path to all images layers used by given image
+    pub fn image_layers(&self, image: &RemoteImage) -> Result<Vec<PathBuf>, anyhow::Error> {
+        let root = self.build_image_layers_path(image);
+        if !root.exists() {
+            return Err(anyhow::anyhow!("unknown image"));
+        }
+
+        let mut entries = vec![];
+        for entry in root.read_dir()? {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                if path.is_file() {
+                    let mut buf = vec![];
+                    let mut file = File::open(&path)?;
+                    file.read_to_end(&mut buf)?;
+
+                    let digest = String::from_utf8(buf)?;
+                    let layer = self.build_image_layer_path(&ImageLayer { digest, size: 0 });
+
+                    let idx: u64 = path
+                        .file_name()
+                        .expect("bug? layer should have file name")
+                        .to_str()
+                        .expect("bug? in fs")
+                        .parse()?;
+
+                    entries.push((idx, layer));
+                }
+            }
+        }
+
+        entries.sort_by(|(idx_a, _), (idx_b, _)| idx_a.cmp(idx_b));
+
+        Ok(entries.into_iter().map(|(_, path)| path).collect())
+    }
+
+    pub fn build_image_layers_path(&self, image: &RemoteImage) -> PathBuf {
+        self.images
+            .join(&image.domain)
+            .join(&image.repository)
+            .join("layers")
+    }
+
+    pub fn build_container_path(&self, id: &String) -> PathBuf {
+        self.containers.join(id)
     }
 
     pub fn build_image_layer_path(&self, layer: &ImageLayer) -> PathBuf {

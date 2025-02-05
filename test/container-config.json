@@ -3,7 +3,7 @@
     "name": "alpine"
   },
   "image": {
-    "image": "alpine"
+    "image": "python"
   },
   "command": ["top"],
   "log_path": "alpine.0.log",

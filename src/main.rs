@@ -1,5 +1,6 @@
 use std::{collections::HashMap, path::Path};
 
+use engine::Engine;
 use reqwest::header::{HeaderMap, HeaderValue};
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -31,24 +32,37 @@ use tracing::{debug, error, info};
 use utils::{parse_www_authenticate, timestamp};
 
 mod cri;
+mod engine;
 mod storage;
 mod utils;
 
 const CRI_USER_AGENT: &'static str = "android-proot-cri";
 
 #[derive(Debug)]
-pub struct Runtime {
+pub struct RuntimeHandler {
+    storage: Storage,
+    engine: Engine,
+}
+
+#[derive(Debug)]
+pub struct ImageHandler {
     storage: Storage,
 }
 
-impl Runtime {
-    fn new(storage: Storage) -> Runtime {
-        Runtime { storage }
+impl RuntimeHandler {
+    fn new(storage: Storage, engine: Engine) -> RuntimeHandler {
+        RuntimeHandler { storage, engine }
+    }
+}
+
+impl ImageHandler {
+    fn new(storage: Storage) -> ImageHandler {
+        ImageHandler { storage }
     }
 }
 
 #[tonic::async_trait]
-impl ImageService for Runtime {
+impl ImageService for ImageHandler {
     #[tracing::instrument]
     async fn image_fs_info(
         &self,
@@ -431,7 +445,7 @@ impl ImageService for Runtime {
 }
 
 #[tonic::async_trait]
-impl RuntimeService for Runtime {
+impl RuntimeService for RuntimeHandler {
     #[tracing::instrument]
     async fn version(
         &self,
@@ -586,9 +600,47 @@ impl RuntimeService for Runtime {
 
     async fn start_container(
         &self,
-        _: Request<StartContainerRequest>,
+        request: Request<StartContainerRequest>,
     ) -> Result<Response<StartContainerResponse>, Status> {
-        unimplemented!();
+        let message = request.into_inner();
+        let config = self
+            .storage
+            .get_container(&message.container_id)
+            .map_err(|error| {
+                error!(?error, "container not in storage");
+                Status::invalid_argument("unknown container")
+            })?;
+
+        let image = {
+            let image_spec = config
+                .image
+                .clone()
+                .ok_or_else(|| Status::internal("unknown container"))?;
+
+            RemoteImage::parse(image_spec.image).map_err(|error| {
+                error!(?error, "failed parsing image");
+                Status::internal("unknown container")
+            })?
+        };
+
+        let layers = self.storage.image_layers(&image).map_err(|error| {
+            error!(?error, "image layers unavailable");
+            Status::invalid_argument("layers error")
+        })?;
+
+        self.engine
+            .run(
+                &config,
+                self.storage.build_container_path(&message.container_id),
+                layers,
+            )
+            .map_err(|error| {
+                let bt = std::backtrace::Backtrace::capture();
+                error!(?error, ?bt, "failed to start container");
+                Status::internal("engine error")
+            })?;
+
+        Ok(Response::new(StartContainerResponse {}))
     }
 
     async fn create_container(
@@ -600,12 +652,13 @@ impl RuntimeService for Runtime {
             .config
             .ok_or_else(|| Status::invalid_argument("config"))?;
 
-        self.pull_image(Request::new(PullImageRequest {
-            image: config.image.clone(),
-            auth: None,
-            sandbox_config: None,
-        }))
-        .await?;
+        ImageHandler::new(self.storage.clone())
+            .pull_image(Request::new(PullImageRequest {
+                image: config.image.clone(),
+                auth: None,
+                sandbox_config: None,
+            }))
+            .await?;
 
         let id = self.storage.add_container(&config).map_err(|error| {
             error!(?error, "failed storing container");
@@ -694,8 +747,8 @@ async fn main() -> Result<(), anyhow::Error> {
     let storage = Storage::new(&root);
     storage.init()?;
 
-    let runtime = Runtime::new(storage.clone());
-    let image = Runtime::new(storage);
+    let runtime = RuntimeHandler::new(storage.clone(), Engine::new());
+    let image = ImageHandler::new(storage);
 
     Server::builder()
         .add_service(RuntimeServiceServer::new(runtime))
