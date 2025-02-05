@@ -15,7 +15,7 @@ use cri::runtime::{
     AttachRequest, AttachResponse, ContainerStatsRequest, ContainerStatsResponse,
     ContainerStatusRequest, ContainerStatusResponse, CreateContainerRequest,
     CreateContainerResponse, ExecRequest, ExecResponse, ExecSyncRequest, ExecSyncResponse,
-    FilesystemIdentifier, FilesystemUsage, ImageFsInfoRequest, ImageFsInfoResponse,
+    FilesystemIdentifier, FilesystemUsage, ImageFsInfoRequest, ImageFsInfoResponse, ImageSpec,
     ImageStatusRequest, ImageStatusResponse, ListContainerStatsRequest, ListContainerStatsResponse,
     ListContainersRequest, ListContainersResponse, ListImagesRequest, ListImagesResponse,
     ListPodSandboxRequest, ListPodSandboxResponse, ListPodSandboxStatsRequest,
@@ -55,16 +55,6 @@ fn parse_www_authenticate(header: &str) -> Option<HashMap<String, String>> {
 
     Some(param_map)
 }
-
-// file structure:
-// images/
-//  \_ alpine
-//  |   \_ abcde....tar.gz
-//  |   \_ abcde....tar.gz
-//  \_ debian
-//  |   \_ abcde....tar.gz
-//  |   \_ abcde....tar.gz
-//
 
 #[derive(Debug)]
 pub struct Runtime {
@@ -123,9 +113,24 @@ impl ImageService for Runtime {
     #[tracing::instrument]
     async fn remove_image(
         &self,
-        _: Request<RemoveImageRequest>,
+        request: Request<RemoveImageRequest>,
     ) -> Result<Response<RemoveImageResponse>, Status> {
-        unimplemented!();
+        let message = request.into_inner();
+        let image = message
+            .image
+            .ok_or_else(|| Status::invalid_argument("image"))?;
+
+        let image = RemoteImage::parse(image.image).map_err(|error| {
+            error!(?error, "failed to parse image");
+            Status::invalid_argument("image")
+        })?;
+
+        self.storage.remove_image(&image).map_err(|error| {
+            error!(?error, "failed to remove image");
+            Status::internal("not removed")
+        })?;
+
+        Ok(Response::new(RemoveImageResponse {}))
     }
 
     #[tracing::instrument]
@@ -139,7 +144,7 @@ impl ImageService for Runtime {
             .ok_or_else(|| Status::invalid_argument("image"))?;
 
         let image = RemoteImage::parse(reference.image).map_err(|error| {
-            error!(err = ?error, "failed to parse remote image");
+            error!(?error, "failed to parse remote image");
             Status::invalid_argument("invalid image")
         })?;
 
@@ -164,7 +169,7 @@ impl ImageService for Runtime {
             .send()
             .await
             .map_err(|error| {
-                error!(err = ?error, "auth token request failed");
+                error!(?error, "auth token request failed");
                 Status::unavailable("authentication failed")
             })?;
 
@@ -176,14 +181,16 @@ impl ImageService for Runtime {
             return Err(Status::internal("image unavailable"));
         }
 
-        let auth_url = resp
+        let (auth_url, service) = resp
             .headers()
             .get("www-authenticate")
             .and_then(|v| v.to_str().ok())
             .and_then(parse_www_authenticate)
             .and_then(|p| {
                 if let Some(realm) = p.get("realm") {
-                    return Some(realm.clone());
+                    if let Some(service) = p.get("service") {
+                        return Some((realm.clone(), service.clone()));
+                    }
                 }
 
                 return None;
@@ -194,8 +201,8 @@ impl ImageService for Runtime {
         // fetch token without credentials
         //
         let query = &[
-            ("service", &image.domain),
-            ("scope", &format!("repository:{}:pull", &image.repository)),
+            ("service", service),
+            ("scope", format!("repository:{}:pull", &image.repository)),
         ];
         let resp = http
             .get(auth_url)
@@ -207,7 +214,7 @@ impl ImageService for Runtime {
             .send()
             .await
             .map_err(|error| {
-                error!(err = ?error, "failed to send authentication");
+                error!(?error, "failed to send authentication");
                 Status::internal("image unavailable")
             })?;
 
@@ -216,7 +223,7 @@ impl ImageService for Runtime {
         }
 
         let data = resp.json::<serde_json::Value>().await.map_err(|error| {
-            error!(err = ?error, "failed to parse json response from authentication");
+            error!(?error, "failed to parse json response from authentication");
             Status::internal("image unavailable")
         })?;
 
@@ -229,7 +236,7 @@ impl ImageService for Runtime {
         debug!(token = token, "fetched token");
 
         let auth_header = HeaderValue::from_str(&format!("Bearer {}", token)).map_err(|error| {
-            error!(err = ?error, "failed to fetch image manifests");
+            error!(?error, "failed to fetch image manifests");
             Status::internal("image unavailable")
         })?;
 
@@ -260,7 +267,7 @@ impl ImageService for Runtime {
             .send()
             .await
             .map_err(|error| {
-                error!(err = ?error, "failed to fetch image manifests");
+                error!(?error, "failed to fetch image manifests");
                 Status::internal("image unavailable")
             })?;
 
@@ -268,7 +275,7 @@ impl ImageService for Runtime {
         debug!(status = ?status, "manifests response");
 
         let data = resp.json::<serde_json::Value>().await.map_err(|error| {
-            error!(err = ?error, "failed to parse json response from manifests");
+            error!(?error, "failed to parse json response from manifests");
             Status::internal("image unavailable")
         })?;
 
@@ -276,7 +283,6 @@ impl ImageService for Runtime {
             .get("manifests")
             .and_then(|v| v.as_array())
             .and_then(|m| {
-                debug!(m = ?m, "found manifest");
                 for manifest in m {
                     if let Some(arch) = manifest.get("platform").and_then(|p| p.get("architecture"))
                     {
@@ -293,13 +299,6 @@ impl ImageService for Runtime {
                 return None;
             })
             .ok_or_else(|| Status::internal("image unavailable"))?;
-
-        let exists = self.storage.add_image_path(&image).map_err(|error| {
-            error!(error = ?error, "failed to add image path");
-            Status::internal("image unavailable")
-        })?;
-
-        debug!(exists = exists, "image already exists");
 
         //
         // fetch the layers
@@ -326,7 +325,7 @@ impl ImageService for Runtime {
             .send()
             .await
             .map_err(|error| {
-                error!(err = ?error, "failed to fetch image layers");
+                error!(?error, "failed to fetch image layers");
                 Status::internal("image unavailable")
             })?;
 
@@ -334,7 +333,7 @@ impl ImageService for Runtime {
         debug!(status = ?status, "layers response");
 
         let data = resp.json::<serde_json::Value>().await.map_err(|error| {
-            error!(err = ?error, "failed to parse json response from layers");
+            error!(?error, "failed to parse json response from layers");
             Status::internal("image unavailable")
         })?;
 
@@ -358,10 +357,13 @@ impl ImageService for Runtime {
             })
             .ok_or_else(|| Status::internal("image unavailable"))?;
 
+        let mut g_layers: Vec<ImageLayer> = Vec::with_capacity(layers.len());
+
         for l in layers {
             if let Some(layer) = l {
                 // TODO: add mutex
                 if self.storage.has_image_layer(&layer) {
+                    g_layers.push(layer);
                     continue;
                 }
 
@@ -388,44 +390,70 @@ impl ImageService for Runtime {
                     .send()
                     .await
                     .map_err(|error| {
-                        error!(err = ?error, "failed to download image layer");
+                        error!(?error, "failed to download image layer");
                         Status::internal("image unavailable")
                     })?;
 
                 let buffer = resp.bytes().await.map_err(|error| {
-                    error!(error = ?error, "failed downloading image layer");
+                    error!(?error, "failed downloading image layer");
                     Status::internal("image unavailable")
                 })?;
 
-                let _ = self
-                    .storage
+                self.storage
                     .add_image_layer(&layer, buffer)
                     .map_err(|error| {
-                        error!(error = ?error, "failed inserting image layer");
+                        error!(?error, "failed inserting image layer");
                         Status::internal("image unavailable")
-                    });
+                    })?;
+
+                g_layers.push(layer);
             }
         }
+
+        let exists = self.storage.add_image(&image, &g_layers).map_err(|error| {
+            error!(?error, "failed to store image");
+            Status::internal("image unavailable")
+        })?;
+        debug!(exists = exists, "image exists");
 
         let reply = PullImageResponse {
             image_ref: image.repository,
         };
-        return Ok(Response::new(reply));
 
-        // get token
-        // https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/alpine:pull (fetch "token")
-        // curl -v -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' -H 'Authorization: Bearer TOKEN' https://registry-1.docker.io/v2/library/alpine/manifests/latest
-        // curl -v -H 'Accept: application/vnd.oci.image.manifest.v1+json' -H 'Authorization: Bearer TOKEN' https://registry-1.docker.io/v2/library/alpine/blobs/sha256:483f502c0e6aff6d80a807f25d3f88afa40439c29fdd2d21a0912e0f42db842a
-        // curl -v -H 'Accept: application/octet-stream' -H 'Authorization: Bearer TOKEN' https://registry-1.docker.io/v2/library/alpine/blobs/sha256:LAYER_HASH
-        // tar -zxf rootfs.tar.gz
+        return Ok(Response::new(reply));
     }
 
     #[tracing::instrument]
     async fn image_status(
         &self,
-        _: Request<ImageStatusRequest>,
+        request: Request<ImageStatusRequest>,
     ) -> Result<Response<ImageStatusResponse>, Status> {
-        unimplemented!();
+        let message = request.into_inner();
+        let image = message
+            .image
+            .ok_or_else(|| Status::invalid_argument("image"))?;
+
+        let image = RemoteImage::parse(image.image).map_err(|error| {
+            error!(?error, "failed to parse image");
+            Status::invalid_argument("image")
+        })?;
+
+        let reply = ImageStatusResponse {
+            image: Some(cri::runtime::Image {
+                id: image.repository.clone(),
+                size: 1,
+                username: "root".to_string(),
+                pinned: false,
+                spec: Some(ImageSpec {
+                    image: image.repository,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        Ok(Response::new(reply))
     }
 
     #[tracing::instrument]
