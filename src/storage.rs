@@ -1,12 +1,30 @@
 use std::{
-    fs,
-    fs::File,
-    io::Write,
+    fmt::Write as FmtWrite,
+    fs::{self, File},
+    io::{Read, Write as IoWrite},
     path::{Path, PathBuf},
 };
 
-use prost::bytes::Buf;
+use anyhow::Context;
+use prost::{bytes::Buf, Message};
+use rand::TryRngCore;
 use tracing::debug;
+
+use crate::{
+    cri::runtime::{Container, ContainerConfig, ContainerState},
+    utils::to_timestamp,
+};
+
+/// Generate hex string of size
+pub fn random_id() -> Result<String, anyhow::Error> {
+    let mut bytes = [0; 32];
+    rand::rng().try_fill_bytes(&mut bytes)?;
+    let mut hex_string = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut hex_string, "{:02x}", byte)?;
+    }
+    Ok(hex_string)
+}
 
 /// Image layer
 #[derive(Debug)]
@@ -59,6 +77,7 @@ impl RemoteImage {
 #[derive(Debug, Clone)]
 pub struct Storage {
     root: PathBuf,
+    containers: PathBuf,
     images: PathBuf,
     layers: PathBuf,
 }
@@ -78,10 +97,12 @@ pub struct Storage {
 impl Storage {
     pub fn new(root: &str) -> Storage {
         let root_path = Path::new(root);
+        let containers = root_path.join("containers");
         let images = root_path.join("images");
         let layers = root_path.join("layers");
         Storage {
             root: root_path.to_path_buf(),
+            containers,
             images,
             layers,
         }
@@ -93,6 +114,10 @@ impl Storage {
             fs::create_dir_all(&self.root)?;
         }
 
+        if !self.containers.exists() {
+            fs::create_dir_all(&self.containers)?;
+        }
+
         if !self.images.exists() {
             fs::create_dir_all(&self.images)?;
         }
@@ -102,6 +127,85 @@ impl Storage {
         }
 
         Ok(())
+    }
+
+    pub fn list_containers(&self) -> Result<Vec<Container>, anyhow::Error> {
+        let mut containers = vec![];
+
+        for entry in self.containers.read_dir()? {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+
+                if path.is_dir() {
+                    // TODO: optimize memory allocations
+                    let mut buf: Vec<u8> = vec![];
+
+                    let mut file = File::open(path.join("spec.bin"))
+                        .context(format!("opening spec at {:?}", &path))?;
+                    file.read_to_end(&mut buf)?;
+
+                    let config: ContainerConfig = prost::Message::decode(&buf[..])
+                        .context(format!("decode container {:?}", &path))?;
+
+                    let mut state = ContainerState::ContainerCreated;
+
+                    if path.join("pid").exists() {
+                        state = ContainerState::ContainerRunning;
+                    }
+
+                    if path.join("retcode").exists() {
+                        state = ContainerState::ContainerExited;
+                    }
+
+                    let created = path.metadata()?.created()?;
+
+                    let image = config.image.clone();
+
+                    let container = Container {
+                        id: path
+                            .file_name()
+                            .expect("bug? unknown container path")
+                            .to_str()
+                            .expect("bug? container name has invalid chars")
+                            .to_string(),
+                        image: image.clone(),
+                        state: state.into(),
+                        created_at: to_timestamp(created)?,
+                        image_ref: image
+                            .and_then(|i| Some(i.image))
+                            .unwrap_or_else(|| String::new()),
+                        metadata: config.metadata,
+                        labels: config.labels,
+                        annotations: config.annotations,
+                        pod_sandbox_id: String::new(),
+                    };
+
+                    debug!(id = container.id, "found container");
+
+                    containers.push(container);
+                }
+            }
+        }
+
+        Ok(containers)
+    }
+
+    /// add new container
+    pub fn add_container(&self, container: &ContainerConfig) -> Result<String, anyhow::Error> {
+        let id = random_id()?;
+        let root = self.containers.join(&id);
+
+        if !root.exists() {
+            fs::create_dir_all(&root)?;
+        }
+
+        let mut buf = vec![];
+        container.encode(&mut buf)?;
+
+        let mut file = File::create(root.join("spec.bin"))?;
+        file.write_all(&buf)?;
+
+        Ok(id)
     }
 
     /// check whether the layer exists

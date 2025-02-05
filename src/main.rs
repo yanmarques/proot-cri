@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::Path,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, path::Path};
 
 use reqwest::header::{HeaderMap, HeaderValue};
 use tokio::net::UnixListener;
@@ -30,31 +26,15 @@ use cri::runtime::{
     UpdateContainerResourcesRequest, UpdateContainerResourcesResponse, UpdateRuntimeConfigRequest,
     UpdateRuntimeConfigResponse, VersionRequest, VersionResponse,
 };
-use storage::{ImageLayer, RemoteImage, Storage};
+use storage::{random_id, ImageLayer, RemoteImage, Storage};
 use tracing::{debug, error, info};
+use utils::{parse_www_authenticate, timestamp};
 
 mod cri;
 mod storage;
+mod utils;
 
 const CRI_USER_AGENT: &'static str = "android-proot-cri";
-
-/// Parse "WWW-Authenticate" header format
-fn parse_www_authenticate(header: &str) -> Option<HashMap<String, String>> {
-    let mut parts = header.splitn(2, " ");
-    let _ = parts.next()?.to_string();
-    let params = parts.next().unwrap_or("");
-
-    let mut param_map = HashMap::new();
-    for param in params.split(",") {
-        let mut kv = param.trim().splitn(2, "=");
-        if let (Some(key), Some(value)) = (kv.next(), kv.next()) {
-            let value = value.trim_matches('"').to_string();
-            param_map.insert(key.to_string(), value);
-        }
-    }
-
-    Some(param_map)
-}
 
 #[derive(Debug)]
 pub struct Runtime {
@@ -74,29 +54,12 @@ impl ImageService for Runtime {
         &self,
         _: Request<ImageFsInfoRequest>,
     ) -> Result<Response<ImageFsInfoResponse>, Status> {
-        let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(d) => d,
-            Err(err) => {
-                error!(err = err.to_string(), "time went backwards?");
-                return Err(Status::unavailable("server error"));
-            }
-        };
-
-        let ts = match i64::try_from(now.as_secs()) {
-            Ok(ts) => ts,
-            Err(err) => {
-                error!(
-                    err = err.to_string(),
-                    ts = now.as_secs(),
-                    "timestamp was too long?"
-                );
-                return Err(Status::unavailable("server error"));
-            }
-        };
-
         let reply = ImageFsInfoResponse {
             image_filesystems: vec![FilesystemUsage {
-                timestamp: ts,
+                timestamp: timestamp().map_err(|error| {
+                    error!(?error, "failed to get timestamp");
+                    Status::internal("image")
+                })?,
                 fs_id: Some(FilesystemIdentifier {
                     mountpoint: "/".to_string(),
                 }),
@@ -595,7 +558,14 @@ impl RuntimeService for Runtime {
         &self,
         _: Request<ListContainersRequest>,
     ) -> Result<Response<ListContainersResponse>, Status> {
-        let reply = ListContainersResponse { containers: vec![] };
+        let containers = self.storage.list_containers().map_err(|error| {
+            error!(?error, "failed to list containers");
+            Status::internal("storage failed")
+        })?;
+
+        debug!(count = containers.len(), "containers count");
+
+        let reply = ListContainersResponse { containers };
 
         Ok(Response::new(reply))
     }
@@ -623,9 +593,28 @@ impl RuntimeService for Runtime {
 
     async fn create_container(
         &self,
-        _: Request<CreateContainerRequest>,
+        request: Request<CreateContainerRequest>,
     ) -> Result<Response<CreateContainerResponse>, Status> {
-        unimplemented!();
+        let message = request.into_inner();
+        let config = message
+            .config
+            .ok_or_else(|| Status::invalid_argument("config"))?;
+
+        self.pull_image(Request::new(PullImageRequest {
+            image: config.image.clone(),
+            auth: None,
+            sandbox_config: None,
+        }))
+        .await?;
+
+        let id = self.storage.add_container(&config).map_err(|error| {
+            error!(?error, "failed storing container");
+            Status::internal("storage unavailable")
+        })?;
+
+        let reply = CreateContainerResponse { container_id: id };
+
+        Ok(Response::new(reply))
     }
 
     async fn list_pod_sandbox(
@@ -660,7 +649,14 @@ impl RuntimeService for Runtime {
         &self,
         _: Request<RunPodSandboxRequest>,
     ) -> Result<Response<RunPodSandboxResponse>, Status> {
-        unimplemented!();
+        let reply = RunPodSandboxResponse {
+            pod_sandbox_id: random_id().map_err(|error| {
+                error!(?error, "rng failed");
+                Status::internal("unable to process")
+            })?,
+        };
+
+        Ok(Response::new(reply))
     }
 }
 

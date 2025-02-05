@@ -35,3 +35,6 @@ testit "pull image with unsupported registry" 0 pull google.com/docker/library/a
 testit "pull non-existant image" 0 pull public.ecr.aws/it/does/not-exists
 testit "pull non-existant tag" 0 pull public.ecr.aws/docker/library/alpine:tag-does-not-exists
 
+testit "create container" 1 create 123 ./test/container-config.json ./test/podsandbox-config.json
+
+testit "list containers" 1 ps -a
