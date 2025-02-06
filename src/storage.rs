@@ -146,14 +146,14 @@ impl Storage {
 
                     let config = self.get_container(&id)?;
 
-                    let mut state = ContainerState::ContainerCreated;
+                    let mut state = ContainerState::ContainerUnknown;
+
+                    if path.join("exitcode").exists() {
+                        state = ContainerState::ContainerExited;
+                    }
 
                     if path.join("pid").exists() {
                         state = ContainerState::ContainerRunning;
-                    }
-
-                    if path.join("retcode").exists() {
-                        state = ContainerState::ContainerExited;
                     }
 
                     let created = path.metadata()?.created()?;
@@ -218,6 +218,25 @@ impl Storage {
             prost::Message::decode(&buf[..]).context(format!("decode container {:?}", &path))?;
 
         Ok(config)
+    }
+
+    /// save exit code of given container and removes
+    /// any existing saved process id
+    pub fn save_container_exitcode(&self, id: &String, exitcode: i32) -> Result<(), anyhow::Error> {
+        let mut file = File::create(self.build_container_path(id).join("exitcode"))?;
+        file.write_all(&exitcode.to_le_bytes())?;
+
+        fs::remove_file(self.build_container_path(id).join("pid"))
+            .expect("container's pid file should exist");
+
+        Ok(())
+    }
+
+    /// save process id of the given container
+    pub fn save_container_pid(&self, id: &String, pid: u32) -> Result<(), anyhow::Error> {
+        let mut file = File::create(self.build_container_path(id).join("pid"))?;
+        file.write_all(pid.to_string().as_bytes())?;
+        Ok(())
     }
 
     /// check whether the layer exists

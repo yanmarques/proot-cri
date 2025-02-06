@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, time::Duration};
 
 use engine::Engine;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -593,9 +593,45 @@ impl RuntimeService for RuntimeHandler {
 
     async fn stop_container(
         &self,
-        _: Request<StopContainerRequest>,
+        request: Request<StopContainerRequest>,
     ) -> Result<Response<StopContainerResponse>, Status> {
-        unimplemented!();
+        let message = request.into_inner();
+        let _ = self
+            .storage
+            .get_container(&message.container_id)
+            .map_err(|error| {
+                error!(?error, "container not in storage");
+                Status::invalid_argument("unknown container")
+            })?;
+
+        let timeout = if message.timeout > 0 {
+            Some(Duration::from_secs(message.timeout.try_into().map_err(
+                |error| {
+                    error!(?error, "stop timeout is too large?");
+                    Status::invalid_argument("stop timeout")
+                },
+            )?))
+        } else {
+            None
+        };
+
+        let exitcode = self
+            .engine
+            .stop(&message.container_id, timeout)
+            .map_err(|error| {
+                let bt = std::backtrace::Backtrace::capture();
+                error!(?error, ?bt, "failed to start container");
+                Status::internal("engine error")
+            })?;
+
+        self.storage
+            .save_container_exitcode(&message.container_id, exitcode)
+            .map_err(|error| {
+                error!(?error, "failed to save container's exitcode");
+                Status::internal("storage error")
+            })?;
+
+        Ok(Response::new(StopContainerResponse {}))
     }
 
     async fn start_container(
@@ -628,8 +664,10 @@ impl RuntimeService for RuntimeHandler {
             Status::invalid_argument("layers error")
         })?;
 
-        self.engine
-            .run(
+        let (pid, _) = self
+            .engine
+            .spawn(
+                &message.container_id,
                 &config,
                 self.storage.build_container_path(&message.container_id),
                 layers,
@@ -637,6 +675,16 @@ impl RuntimeService for RuntimeHandler {
             .map_err(|error| {
                 let bt = std::backtrace::Backtrace::capture();
                 error!(?error, ?bt, "failed to start container");
+                Status::internal("engine error")
+            })?;
+
+        self.storage
+            .save_container_pid(&message.container_id, pid)
+            .map_err(|error| {
+                error!(?error, "failed to save container's pid");
+                self.engine
+                    .stop(&message.container_id, None)
+                    .expect("could not save container pid, then could not stop the container");
                 Status::internal("engine error")
             })?;
 

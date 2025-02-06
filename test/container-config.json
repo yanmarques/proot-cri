@@ -5,7 +5,7 @@
   "image": {
     "image": "python"
   },
-  "command": ["top"],
+  "command": ["test-init", "4"],
   "log_path": "alpine.0.log",
   "linux": {}
 }

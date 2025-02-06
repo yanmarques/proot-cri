@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 tonic = "0.12.3"
 prost = "0.13"
-tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "signal"] }
 anyhow = "1.0.95"
 tokio-stream = "0.1.17"
 tracing = "0.1.41"
@@ -17,6 +17,11 @@ rand = "0.9.0"
 flate2 = "1.0.35"
 tempfile = "3.16.0"
 tar = "0.4.43"
+nix = { version = "0.29.0", features = ["process", "signal"] }
+
+[[bin]]
+name = "test-init"
+
 
 [build-dependencies]
 tonic-build = "*"

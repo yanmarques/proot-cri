@@ -6,17 +6,37 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
+    thread::sleep,
+    time::{Duration, SystemTime},
 };
 
+use anyhow::Context;
 use flate2::read::GzDecoder;
+use nix::{
+    sys::{
+        signal::Signal,
+        wait::{WaitPidFlag, WaitStatus},
+    },
+    unistd::Pid,
+};
 use tracing::debug;
 
 use crate::cri::runtime::ContainerConfig;
 
+/// Holds the proot process that run the container
+#[derive(Debug)]
+pub struct PRootProc {
+    /// The underlying system process
+    child: Child,
+
+    /// The process id of the entrypoint
+    init_pid: u32,
+}
+
 /// Container engine
 #[derive(Debug, Default)]
 pub struct Engine {
-    containers: Arc<Mutex<Vec<Child>>>,
+    containers: Arc<Mutex<HashMap<String, PRootProc>>>,
 }
 
 impl Engine {
@@ -26,13 +46,120 @@ impl Engine {
         }
     }
 
-    // Start a new container
-    pub fn run(
+    // Stop an existing container
+    //
+    // The way the container is stopped would not be considered trivial. Because proot uses ptrace
+    // to simulate an isolated environment, sending a SIGTERM to the child entrypoint process
+    // (e.g., sh, python, etc.) requires significant changes to proot source code.
+    // The way implemented is simpler. We first obtain the process id of the init process, and
+    // store it in the `PRootProc.init_pid` attribute. Next, we send a SIGTERM to the init process.
+    // Finally, we obtain the exit code of the init process through the exit code of proot.
+    pub fn stop(&self, id: &String, timeout: Option<Duration>) -> Result<i32, anyhow::Error> {
+        let mut lock = self.containers.lock().expect("lock poisoned");
+        let container = lock
+            .borrow_mut()
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("unknown container"))?;
+
+        // TODO: also check proot process stopped
+        let init_pid = container.init_pid;
+
+        debug!(?init_pid, "stopping container");
+
+        // process id of proot
+        let proot_pid = Pid::from_raw(
+            container
+                .child
+                .id()
+                .try_into()
+                .expect("bug? pid is too large"),
+        );
+
+        if init_pid == 0 {
+            drop(lock.borrow_mut().remove(id));
+            return Err(anyhow::anyhow!("container was not successfully started"));
+        }
+
+        // close stdin to avoid deadlock
+        drop(container.child.stdin.take());
+
+        // don't keep the lock while trying to and for the container process to wait
+        drop(lock);
+
+        //
+        // attempt to stop container process gracefully
+        //
+        nix::sys::signal::kill(
+            Pid::from_raw(init_pid.try_into().expect("bug? pid is too large")),
+            Signal::SIGTERM,
+        )?;
+
+        // containerd default timeout is 10
+        // @see https://github.com/containerd/containerd/blob/59c8cf6ea5f4175ad512914dd5ce554942bf144f/integration/nri_test.go#L48
+        let wait_timeout = timeout
+            .or_else(|| Some(Duration::from_secs(10)))
+            .expect("stop timeout")
+            .as_secs();
+
+        let now = SystemTime::now();
+        let mut exitcode: i32 = -1;
+        let mut exited = false;
+
+        loop {
+            // wait for pid to exit non-block - similar to the `try_wait()` implementation
+            if let Ok(status) = nix::sys::wait::waitpid(proot_pid, Some(WaitPidFlag::WNOHANG)) {
+                match status {
+                    WaitStatus::Exited(_, code) => {
+                        exitcode = code;
+                        exited = true;
+                        break;
+                    }
+                    WaitStatus::Signaled(_, _, _) => {}
+                    WaitStatus::Stopped(_, _) => {}
+                    WaitStatus::PtraceEvent(_, _, _) => {}
+                    WaitStatus::PtraceSyscall(_) => {}
+                    WaitStatus::Continued(_) => {}
+                    WaitStatus::StillAlive => {}
+                }
+            }
+
+            let elapsed = now.elapsed()?;
+            if elapsed.as_secs() > wait_timeout {
+                break;
+            }
+
+            sleep(Duration::from_millis(200));
+        }
+
+        let mut lock = self.containers.lock().expect("lock poisoned");
+        drop(lock.borrow_mut().remove(id));
+        drop(lock);
+
+        if !exited {
+            // the processes did not exited yet
+            // we have to SIGKILL proot process, which will send a SIGKILL to the init process
+            nix::sys::signal::kill(proot_pid, Signal::SIGKILL)?;
+        }
+
+        debug!(exitcode, "container stopped");
+
+        Ok(exitcode)
+    }
+
+    // Start a ne container
+    pub fn spawn(
         &self,
+        id: &String,
         config: &ContainerConfig,
         container_dir: PathBuf,
         image_layers: Vec<PathBuf>,
-    ) -> Result<u32, anyhow::Error> {
+    ) -> Result<(u32, u32), anyhow::Error> {
+        let mut lock = self.containers.lock().expect("lock poisoned");
+        if lock.borrow_mut().get(id).is_some() {
+            return Err(anyhow::anyhow!("container already exists"));
+        }
+        drop(lock);
+
         let mut args: Vec<String> = vec![];
 
         let root = container_dir.join("mounts").join("root");
@@ -44,6 +171,9 @@ impl Engine {
         args.push("/dev/".to_string());
         args.push("-b".to_string());
         args.push("/proc/".to_string());
+
+        //
+        args.push("--kill-on-exit".to_string());
 
         args.push("-w".to_string());
         if config.working_dir == "" {
@@ -93,12 +223,18 @@ impl Engine {
             }
         }
 
+        let mut write_init_pid = tempfile::NamedTempFile::new()?;
+
         // reasonable default environment vars, all those seem to be required to many programs
         let mut default_envs = HashMap::from([
             ("PATH", "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin"),
             ("HOME", "/"),
             ("SHELL", "/bin/sh"),
             ("TERM", "xterm"),
+            (
+                "PROOT_WRITE_INIT_PID",
+                write_init_pid.path().to_str().expect("tempfile failed"),
+            ),
         ]);
 
         for k in config.envs.iter() {
@@ -106,6 +242,8 @@ impl Engine {
         }
 
         let log = File::create(container_dir.join("out.log"))?;
+
+        debug!(?args, "cmd args");
 
         // TODO: do not inherit stdin, when needed, allocate a new pty for the container
         let mut container = Command::new("./proot")
@@ -128,14 +266,46 @@ impl Engine {
             }
         }
 
-        // save process id
-        let pid = container.id();
-        let mut file = File::create(container_dir.join("pid"))?;
-        file.write_all(pid.to_string().as_bytes())?;
+        //
+        // proot does not handle gracefully shutting down child processes because of ptrace (I guess)
+        // therefore we must get the process id of the init process to later gracefully shut it down
+        //
+        let timeout = 2;
+        let begin = SystemTime::now();
+        let mut init_pid = 0;
+
+        loop {
+            let mut buf = vec![];
+            write_init_pid.read_to_end(&mut buf)?;
+            if buf.len() > 0 {
+                init_pid = String::from_utf8(buf)?
+                    .parse::<u32>()
+                    .context("parsing init pid")?;
+                break;
+            }
+
+            let elapsed = begin.elapsed()?;
+            if elapsed.as_secs() > timeout {
+                break;
+            }
+        }
+
+        if init_pid == 0 {
+            // TODO: we can probably do something better when this happens, for now, we will
+            // silently ignore because proot will likely exit anyway
+        }
+
+        let proot_pid = container.id();
 
         let mut lock = self.containers.lock().expect("lock poisoned");
-        lock.borrow_mut().push(container);
+        lock.borrow_mut().insert(
+            id.clone(),
+            PRootProc {
+                child: container,
+                init_pid,
+            },
+        );
 
-        Ok(pid)
+        Ok((proot_pid, init_pid))
     }
 }
