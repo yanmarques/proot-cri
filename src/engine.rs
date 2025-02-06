@@ -34,7 +34,7 @@ pub struct PRootProc {
 }
 
 /// Container engine
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Engine {
     containers: Arc<Mutex<HashMap<String, PRootProc>>>,
 }
@@ -44,6 +44,33 @@ impl Engine {
         Engine {
             ..Default::default()
         }
+    }
+
+    /// Stop all existing containers and return all errors encountered along the way
+    pub fn shutdown(self) -> Vec<(String, Result<i32, anyhow::Error>)> {
+        let mut lock = self.containers.lock().expect("lock poisoned");
+        lock.borrow_mut()
+            .iter_mut()
+            .map(|(id, container)| {
+                let init_pid = container.init_pid;
+                let proot_pid = container.child.id();
+
+                // close stdin to avoid deadlock
+                drop(container.child.stdin.take());
+
+                match self.check_zombie_process(container) {
+                    Ok(None) => {}
+                    Ok(Some(exitcode)) => {
+                        return (id.clone(), Ok(exitcode));
+                    }
+                    Err(error) => {
+                        return (id.clone(), Err(error));
+                    }
+                };
+
+                (id.clone(), self.inner_stop(init_pid, proot_pid, id, None))
+            })
+            .collect()
     }
 
     // Stop an existing container
@@ -61,30 +88,43 @@ impl Engine {
             .get_mut(id)
             .ok_or_else(|| anyhow::anyhow!("unknown container"))?;
 
-        // TODO: also check proot process stopped
         let init_pid = container.init_pid;
-
-        debug!(?init_pid, "stopping container");
-
-        // process id of proot
-        let proot_pid = Pid::from_raw(
-            container
-                .child
-                .id()
-                .try_into()
-                .expect("bug? pid is too large"),
-        );
-
-        if init_pid == 0 {
-            drop(lock.borrow_mut().remove(id));
-            return Err(anyhow::anyhow!("container was not successfully started"));
-        }
+        let proot_pid = container.child.id();
 
         // close stdin to avoid deadlock
         drop(container.child.stdin.take());
 
+        match self.check_zombie_process(container) {
+            Ok(None) => {}
+            Ok(Some(exitcode)) => {
+                drop(lock.borrow_mut().remove(id));
+                return Ok(exitcode);
+            }
+            Err(error) => {
+                drop(lock.borrow_mut().remove(id));
+                return Err(error);
+            }
+        };
+
         // don't keep the lock while trying to and for the container process to wait
         drop(lock);
+
+        self.inner_stop(init_pid, proot_pid, id, timeout)
+    }
+
+    fn inner_stop(
+        &self,
+        init_pid: u32,
+        proot_pid: u32,
+        id: &String,
+        timeout: Option<Duration>,
+    ) -> Result<i32, anyhow::Error> {
+        // TODO: also check proot process stopped
+
+        debug!(?init_pid, "stopping container");
+
+        // process id of proot
+        let proot_pid = Pid::from_raw(proot_pid.try_into().expect("bug? pid is too large"));
 
         //
         // attempt to stop container process gracefully
@@ -144,6 +184,24 @@ impl Engine {
         debug!(exitcode, "container stopped");
 
         Ok(exitcode)
+    }
+
+    fn check_zombie_process(
+        &self,
+        container: &mut PRootProc,
+    ) -> Result<Option<i32>, anyhow::Error> {
+        if container.init_pid == 0 {
+            // avoid a zombie proot process
+            if let Ok(Some(status)) = container.child.try_wait() {
+                if let Some(exitcode) = status.code() {
+                    return Ok(Some(exitcode));
+                }
+            }
+
+            return Err(anyhow::anyhow!("container failed to start"));
+        }
+
+        Ok(None)
     }
 
     // Start a ne container

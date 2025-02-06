@@ -1,8 +1,11 @@
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{collections::HashMap, path::Path, process::ExitCode, time::Duration};
 
 use engine::Engine;
 use reqwest::header::{HeaderMap, HeaderValue};
-use tokio::net::UnixListener;
+use tokio::{
+    net::UnixListener,
+    signal::unix::{signal, SignalKind},
+};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{transport::Server, Request, Response, Status};
 
@@ -90,22 +93,22 @@ impl ImageService for ImageHandler {
     #[tracing::instrument]
     async fn remove_image(
         &self,
-        request: Request<RemoveImageRequest>,
+        _request: Request<RemoveImageRequest>,
     ) -> Result<Response<RemoveImageResponse>, Status> {
-        let message = request.into_inner();
-        let image = message
-            .image
-            .ok_or_else(|| Status::invalid_argument("image"))?;
-
-        let image = RemoteImage::parse(image.image).map_err(|error| {
-            error!(?error, "failed to parse image");
-            Status::invalid_argument("image")
-        })?;
-
-        self.storage.remove_image(&image).map_err(|error| {
-            error!(?error, "failed to remove image");
-            Status::internal("not removed")
-        })?;
+        // let message = request.into_inner();
+        // let image = message
+        //     .image
+        //     .ok_or_else(|| Status::invalid_argument("image"))?;
+        //
+        // let image = RemoteImage::parse(image.image).map_err(|error| {
+        //     error!(?error, "failed to parse image");
+        //     Status::invalid_argument("image")
+        // })?;
+        //
+        // self.storage.remove_image(&image).map_err(|error| {
+        //     error!(?error, "failed to remove image");
+        //     Status::internal("not removed")
+        // })?;
 
         Ok(Response::new(RemoveImageResponse {}))
     }
@@ -563,9 +566,24 @@ impl RuntimeService for RuntimeHandler {
 
     async fn container_status(
         &self,
-        _: Request<ContainerStatusRequest>,
+        request: Request<ContainerStatusRequest>,
     ) -> Result<Response<ContainerStatusResponse>, Status> {
-        unimplemented!();
+        let message = request.into_inner();
+
+        let status = self
+            .storage
+            .get_container_status(&message.container_id)
+            .map_err(|error| {
+                error!(?error, "failed to list containers");
+                Status::internal("storage failed")
+            })?;
+
+        let reply = ContainerStatusResponse {
+            status: Some(status),
+            ..Default::default()
+        };
+
+        Ok(Response::new(reply))
     }
 
     async fn list_containers(
@@ -598,7 +616,7 @@ impl RuntimeService for RuntimeHandler {
         let message = request.into_inner();
         let _ = self
             .storage
-            .get_container(&message.container_id)
+            .get_container_config(&message.container_id)
             .map_err(|error| {
                 error!(?error, "container not in storage");
                 Status::invalid_argument("unknown container")
@@ -641,7 +659,7 @@ impl RuntimeService for RuntimeHandler {
         let message = request.into_inner();
         let config = self
             .storage
-            .get_container(&message.container_id)
+            .get_container_config(&message.container_id)
             .map_err(|error| {
                 error!(?error, "container not in storage");
                 Status::invalid_argument("unknown container")
@@ -795,14 +813,43 @@ async fn main() -> Result<(), anyhow::Error> {
     let storage = Storage::new(&root);
     storage.init()?;
 
-    let runtime = RuntimeHandler::new(storage.clone(), Engine::new());
-    let image = ImageHandler::new(storage);
+    let engine = Engine::new();
 
-    Server::builder()
+    let runtime = RuntimeHandler::new(storage.clone(), engine.clone());
+    let image = ImageHandler::new(storage.clone());
+
+    let server = Server::builder()
         .add_service(RuntimeServiceServer::new(runtime))
         .add_service(ImageServiceServer::new(image))
-        .serve_with_incoming(uds_stream)
-        .await?;
+        .serve_with_incoming(uds_stream);
+
+    let mut ctrl_c = signal(SignalKind::interrupt())?;
+    let mut term = signal(SignalKind::terminate())?;
+
+    tokio::select! {
+        _ = server => {}
+        _ = ctrl_c.recv() => {}
+        _ = term.recv() => {}
+    };
+
+    info!("stopping all containers...");
+
+    engine.shutdown().iter().for_each(|(id, result)| {
+        match result {
+            Ok(exitcode) => {
+                let _ = storage
+                    .save_container_exitcode(&id, exitcode.clone())
+                    .inspect_err(|error| {
+                        error!(id, ?error, "failed to save container exit code");
+                    });
+            }
+            Err(error) => {
+                error!(id, ?error, "failed to stop container");
+            }
+        };
+    });
+
+    info!("exiting...");
 
     Ok(())
 }

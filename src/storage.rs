@@ -11,7 +11,7 @@ use rand::TryRngCore;
 use tracing::debug;
 
 use crate::{
-    cri::runtime::{Container, ContainerConfig, ContainerState},
+    cri::runtime::{Container, ContainerConfig, ContainerState, ContainerStatus},
     utils::to_timestamp,
 };
 
@@ -144,19 +144,9 @@ impl Storage {
                         .expect("bug? container name has invalid chars")
                         .to_string();
 
-                    let config = self.get_container(&id)?;
+                    let config = self.get_container_config(&id)?;
 
-                    let mut state = ContainerState::ContainerUnknown;
-
-                    if path.join("exitcode").exists() {
-                        state = ContainerState::ContainerExited;
-                    }
-
-                    if path.join("pid").exists() {
-                        state = ContainerState::ContainerRunning;
-                    }
-
-                    let created = path.metadata()?.created()?;
+                    let (state, created) = self.lookup_container_state_and_created_at(&path)?;
 
                     let image = config.image.clone();
 
@@ -164,7 +154,7 @@ impl Storage {
                         id,
                         image: image.clone(),
                         state: state.into(),
-                        created_at: to_timestamp(created)?,
+                        created_at: created,
                         image_ref: image
                             .and_then(|i| Some(i.image))
                             .unwrap_or_else(|| String::new()),
@@ -182,6 +172,25 @@ impl Storage {
         }
 
         Ok(containers)
+    }
+
+    fn lookup_container_state_and_created_at(
+        &self,
+        path_to_container: &PathBuf,
+    ) -> Result<(ContainerState, i64), anyhow::Error> {
+        let mut state = ContainerState::ContainerUnknown;
+
+        if path_to_container.join("exitcode").exists() {
+            state = ContainerState::ContainerExited;
+        }
+
+        if path_to_container.join("pid").exists() {
+            state = ContainerState::ContainerRunning;
+        }
+
+        let created = path_to_container.metadata()?.created()?;
+
+        Ok((state, to_timestamp(created)?))
     }
 
     /// add new container
@@ -204,7 +213,43 @@ impl Storage {
         Ok(id)
     }
 
-    pub fn get_container(&self, id: &String) -> Result<ContainerConfig, anyhow::Error> {
+    /// get status information of given container
+    pub fn get_container_status(&self, id: &String) -> Result<ContainerStatus, anyhow::Error> {
+        let path = self.containers.join(id);
+
+        let config = self.get_container_config(id)?;
+
+        let (state, created) = self.lookup_container_state_and_created_at(&path)?;
+
+        let mut buf = [0; 4];
+        let mut file = File::open(self.build_container_path(id).join("exitcode"))?;
+        file.read(&mut buf)?;
+        let exit_code = i32::from_le_bytes(buf);
+
+        let status = ContainerStatus {
+            id: id.clone(),
+            created_at: created,
+            exit_code,
+            finished_at: 0,
+            started_at: 0,
+            log_path: path.join("out.log").to_str().expect("log path").to_string(),
+            message: String::new(),
+            state: state.into(),
+            image: config.image.clone(),
+            annotations: config.annotations,
+            image_ref: config
+                .image
+                .and_then(|i| Some(i.image))
+                .unwrap_or_else(|| String::new()),
+            labels: config.labels,
+            metadata: config.metadata,
+            mounts: config.mounts,
+            reason: String::new(),
+        };
+
+        Ok(status)
+    }
+    pub fn get_container_config(&self, id: &String) -> Result<ContainerConfig, anyhow::Error> {
         let path = self.containers.join(id);
 
         // TODO: optimize memory allocations
@@ -304,7 +349,7 @@ impl Storage {
     pub fn image_layers(&self, image: &RemoteImage) -> Result<Vec<PathBuf>, anyhow::Error> {
         let root = self.build_image_layers_path(image);
         if !root.exists() {
-            return Err(anyhow::anyhow!("unknown image"));
+            return Err(anyhow::anyhow!("unknown image: {image:?}"));
         }
 
         let mut entries = vec![];
