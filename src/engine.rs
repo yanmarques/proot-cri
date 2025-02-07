@@ -289,6 +289,7 @@ impl Engine {
             ("HOME", "/"),
             ("SHELL", "/bin/sh"),
             ("TERM", "xterm"),
+            ("PROOT_TMP_DIR", "/data/local/tmp"),
             (
                 "PROOT_WRITE_INIT_PID",
                 write_init_pid.path().to_str().expect("tempfile failed"),

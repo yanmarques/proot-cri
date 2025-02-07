@@ -1,6 +1,6 @@
-use std::{collections::HashMap, path::Path, process::ExitCode, time::Duration};
+use std::{collections::HashMap, error::Error, path::Path, time::Duration};
 
-use engine::Engine;
+use clap::Parser;
 use reqwest::header::{HeaderMap, HeaderValue};
 use tokio::{
     net::UnixListener,
@@ -12,17 +12,18 @@ use tonic::{transport::Server, Request, Response, Status};
 use cri::runtime::{
     image_service_server::{ImageService, ImageServiceServer},
     runtime_service_server::{RuntimeService, RuntimeServiceServer},
-    AttachRequest, AttachResponse, ContainerStatsRequest, ContainerStatsResponse,
-    ContainerStatusRequest, ContainerStatusResponse, CreateContainerRequest,
-    CreateContainerResponse, ExecRequest, ExecResponse, ExecSyncRequest, ExecSyncResponse,
-    FilesystemIdentifier, FilesystemUsage, ImageFsInfoRequest, ImageFsInfoResponse, ImageSpec,
-    ImageStatusRequest, ImageStatusResponse, ListContainerStatsRequest, ListContainerStatsResponse,
-    ListContainersRequest, ListContainersResponse, ListImagesRequest, ListImagesResponse,
-    ListPodSandboxRequest, ListPodSandboxResponse, ListPodSandboxStatsRequest,
-    ListPodSandboxStatsResponse, PodSandboxStatsRequest, PodSandboxStatsResponse,
-    PodSandboxStatusRequest, PodSandboxStatusResponse, PortForwardRequest, PortForwardResponse,
-    PullImageRequest, PullImageResponse, RemoveContainerRequest, RemoveContainerResponse,
-    RemoveImageRequest, RemoveImageResponse, RemovePodSandboxRequest, RemovePodSandboxResponse,
+    AttachRequest, AttachResponse, ContainerAttributes, ContainerStats, ContainerStatsRequest,
+    ContainerStatsResponse, ContainerStatusRequest, ContainerStatusResponse,
+    CreateContainerRequest, CreateContainerResponse, ExecRequest, ExecResponse, ExecSyncRequest,
+    ExecSyncResponse, FilesystemIdentifier, FilesystemUsage, ImageFsInfoRequest,
+    ImageFsInfoResponse, ImageSpec, ImageStatusRequest, ImageStatusResponse,
+    ListContainerStatsRequest, ListContainerStatsResponse, ListContainersRequest,
+    ListContainersResponse, ListImagesRequest, ListImagesResponse, ListPodSandboxRequest,
+    ListPodSandboxResponse, ListPodSandboxStatsRequest, ListPodSandboxStatsResponse,
+    PodSandboxStatsRequest, PodSandboxStatsResponse, PodSandboxStatusRequest,
+    PodSandboxStatusResponse, PortForwardRequest, PortForwardResponse, PullImageRequest,
+    PullImageResponse, RemoveContainerRequest, RemoveContainerResponse, RemoveImageRequest,
+    RemoveImageResponse, RemovePodSandboxRequest, RemovePodSandboxResponse,
     ReopenContainerLogRequest, ReopenContainerLogResponse, RunPodSandboxRequest,
     RunPodSandboxResponse, RuntimeCondition, RuntimeStatus, StartContainerRequest,
     StartContainerResponse, StatusRequest, StatusResponse, StopContainerRequest,
@@ -30,7 +31,8 @@ use cri::runtime::{
     UpdateContainerResourcesRequest, UpdateContainerResourcesResponse, UpdateRuntimeConfigRequest,
     UpdateRuntimeConfigResponse, VersionRequest, VersionResponse,
 };
-use storage::{random_id, ImageLayer, RemoteImage, Storage};
+use engine::Engine;
+use storage::{ImageLayer, RemoteImage, Storage};
 use tracing::{debug, error, info};
 use utils::{parse_www_authenticate, timestamp};
 
@@ -71,6 +73,7 @@ impl ImageService for ImageHandler {
         &self,
         _: Request<ImageFsInfoRequest>,
     ) -> Result<Response<ImageFsInfoResponse>, Status> {
+        debug!("image fs info");
         let reply = ImageFsInfoResponse {
             image_filesystems: vec![FilesystemUsage {
                 timestamp: timestamp().map_err(|error| {
@@ -78,12 +81,15 @@ impl ImageService for ImageHandler {
                     Status::internal("image")
                 })?,
                 fs_id: Some(FilesystemIdentifier {
-                    mountpoint: "/".to_string(),
+                    mountpoint: self
+                        .storage
+                        .mountpoint()
+                        .to_str()
+                        .expect("mountpoint")
+                        .to_string(),
                 }),
-                inodes_used: Some(cri::runtime::UInt64Value { value: 9999 }),
-                used_bytes: Some(cri::runtime::UInt64Value {
-                    value: 1024 * 1024 * 1024,
-                }),
+                inodes_used: Some(cri::runtime::UInt64Value { value: 0 }),
+                used_bytes: Some(cri::runtime::UInt64Value { value: 0 }),
             }],
         };
 
@@ -118,6 +124,7 @@ impl ImageService for ImageHandler {
         &self,
         request: Request<PullImageRequest>,
     ) -> Result<Response<PullImageResponse>, Status> {
+        debug!("pull image");
         let message = request.into_inner();
         let reference = message
             .image
@@ -133,7 +140,14 @@ impl ImageService for ImageHandler {
             return Err(Status::invalid_argument("auth is not supported"));
         }
 
-        let http = reqwest::Client::new();
+        let http = reqwest::Client::builder().build().map_err(|error| {
+            error!(
+                ?error,
+                source = error.source().unwrap(),
+                "failed to initialize client builder"
+            );
+            Status::internal("internal")
+        })?;
 
         // @link https://github.com/openshift/docker-distribution/blob/master/docs/spec/api.md#api-version-check
         //
@@ -161,7 +175,9 @@ impl ImageService for ImageHandler {
             return Err(Status::internal("image unavailable"));
         }
 
-        let (auth_url, service) = resp
+        let mut token = String::new();
+
+        if let Some((auth_url, service)) = resp
             .headers()
             .get("www-authenticate")
             .and_then(|v| v.to_str().ok())
@@ -175,45 +191,45 @@ impl ImageService for ImageHandler {
 
                 return None;
             })
-            .ok_or_else(|| Status::invalid_argument("remote is not a registry"))?;
+        {
+            //
+            // fetch token without credentials
+            //
+            let query = &[
+                ("service", service),
+                ("scope", format!("repository:{}:pull", &image.repository)),
+            ];
+            let resp = http
+                .get(auth_url)
+                .headers(HeaderMap::from_iter([(
+                    reqwest::header::USER_AGENT,
+                    HeaderValue::from_static(CRI_USER_AGENT),
+                )]))
+                .query(&query)
+                .send()
+                .await
+                .map_err(|error| {
+                    error!(?error, "failed to send authentication");
+                    Status::internal("image unavailable")
+                })?;
 
-        //
-        // fetch token without credentials
-        //
-        let query = &[
-            ("service", service),
-            ("scope", format!("repository:{}:pull", &image.repository)),
-        ];
-        let resp = http
-            .get(auth_url)
-            .headers(HeaderMap::from_iter([(
-                reqwest::header::USER_AGENT,
-                HeaderValue::from_static(CRI_USER_AGENT),
-            )]))
-            .query(&query)
-            .send()
-            .await
-            .map_err(|error| {
-                error!(?error, "failed to send authentication");
+            if !resp.status().is_success() {
+                return Err(Status::internal("image unavailable"));
+            }
+
+            let data = resp.json::<serde_json::Value>().await.map_err(|error| {
+                error!(?error, "failed to parse json response from authentication");
                 Status::internal("image unavailable")
             })?;
 
-        if !resp.status().is_success() {
-            return Err(Status::internal("image unavailable"));
+            token = data
+                .get("token")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .ok_or_else(|| Status::internal("image unavailable"))?;
+
+            debug!(token = token, "fetched token");
         }
-
-        let data = resp.json::<serde_json::Value>().await.map_err(|error| {
-            error!(?error, "failed to parse json response from authentication");
-            Status::internal("image unavailable")
-        })?;
-
-        let token = data
-            .get("token")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .ok_or_else(|| Status::internal("image unavailable"))?;
-
-        debug!(token = token, "fetched token");
 
         let auth_header = HeaderValue::from_str(&format!("Bearer {}", token)).map_err(|error| {
             error!(?error, "failed to fetch image manifests");
@@ -454,11 +470,12 @@ impl RuntimeService for RuntimeHandler {
         &self,
         _: Request<VersionRequest>,
     ) -> Result<Response<VersionResponse>, Status> {
+        debug!("cri version");
         let reply = VersionResponse {
-            version: "v1".to_string(),
+            version: "0.1.0".to_string(),
+            runtime_api_version: "v1".to_string(),
             runtime_name: "android-proot-cri".to_string(),
             runtime_version: "v0.1.0".to_string(),
-            runtime_api_version: "0.1.0".to_string(),
         };
 
         Ok(Response::new(reply))
@@ -466,20 +483,16 @@ impl RuntimeService for RuntimeHandler {
 
     #[tracing::instrument]
     async fn status(&self, _: Request<StatusRequest>) -> Result<Response<StatusResponse>, Status> {
+        debug!("cri status");
         let conditions = vec![
             RuntimeCondition {
                 status: true,
-                message: "RuntimeReady".to_string(),
+                r#type: "RuntimeReady".to_string(),
                 ..Default::default()
             },
             RuntimeCondition {
                 status: true,
-                message: "NetworkReady".to_string(),
-                ..Default::default()
-            },
-            RuntimeCondition {
-                status: true,
-                message: "NetworkPluginReady".to_string(),
+                r#type: "NetworkReady".to_string(),
                 ..Default::default()
             },
         ];
@@ -500,6 +513,7 @@ impl RuntimeService for RuntimeHandler {
         unimplemented!();
     }
 
+    #[tracing::instrument]
     async fn list_pod_sandbox_stats(
         &self,
         _: Request<ListPodSandboxStatsRequest>,
@@ -507,6 +521,7 @@ impl RuntimeService for RuntimeHandler {
         unimplemented!();
     }
 
+    #[tracing::instrument]
     async fn pod_sandbox_stats(
         &self,
         _: Request<PodSandboxStatsRequest>,
@@ -514,20 +529,30 @@ impl RuntimeService for RuntimeHandler {
         unimplemented!();
     }
 
+    #[tracing::instrument]
     async fn list_container_stats(
         &self,
         _: Request<ListContainerStatsRequest>,
     ) -> Result<Response<ListContainerStatsResponse>, Status> {
-        unimplemented!();
+        debug!("container stats");
+        let reply = ListContainerStatsResponse { stats: vec![] };
+
+        Ok(Response::new(reply))
     }
 
+    #[tracing::instrument]
     async fn container_stats(
         &self,
         _: Request<ContainerStatsRequest>,
     ) -> Result<Response<ContainerStatsResponse>, Status> {
-        unimplemented!();
+        debug!("container stats");
+
+        let reply = ContainerStatsResponse { stats: None };
+
+        Ok(Response::new(reply))
     }
 
+    #[tracing::instrument]
     async fn port_forward(
         &self,
         _: Request<PortForwardRequest>,
@@ -535,14 +560,17 @@ impl RuntimeService for RuntimeHandler {
         unimplemented!();
     }
 
+    #[tracing::instrument]
     async fn attach(&self, _: Request<AttachRequest>) -> Result<Response<AttachResponse>, Status> {
         unimplemented!();
     }
 
+    #[tracing::instrument]
     async fn exec(&self, _: Request<ExecRequest>) -> Result<Response<ExecResponse>, Status> {
         unimplemented!();
     }
 
+    #[tracing::instrument]
     async fn exec_sync(
         &self,
         _: Request<ExecSyncRequest>,
@@ -586,6 +614,7 @@ impl RuntimeService for RuntimeHandler {
         Ok(Response::new(reply))
     }
 
+    // #[tracing::instrument]
     async fn list_containers(
         &self,
         _: Request<ListContainersRequest>,
@@ -594,8 +623,6 @@ impl RuntimeService for RuntimeHandler {
             error!(?error, "failed to list containers");
             Status::internal("storage failed")
         })?;
-
-        debug!(count = containers.len(), "containers count");
 
         let reply = ListContainersResponse { containers };
 
@@ -609,6 +636,7 @@ impl RuntimeService for RuntimeHandler {
         unimplemented!();
     }
 
+    #[tracing::instrument]
     async fn stop_container(
         &self,
         request: Request<StopContainerRequest>,
@@ -652,10 +680,12 @@ impl RuntimeService for RuntimeHandler {
         Ok(Response::new(StopContainerResponse {}))
     }
 
+    #[tracing::instrument]
     async fn start_container(
         &self,
         request: Request<StartContainerRequest>,
     ) -> Result<Response<StartContainerResponse>, Status> {
+        debug!("start container");
         let message = request.into_inner();
         let config = self
             .storage
@@ -709,6 +739,7 @@ impl RuntimeService for RuntimeHandler {
         Ok(Response::new(StartContainerResponse {}))
     }
 
+    #[tracing::instrument]
     async fn create_container(
         &self,
         request: Request<CreateContainerRequest>,
@@ -736,20 +767,45 @@ impl RuntimeService for RuntimeHandler {
         Ok(Response::new(reply))
     }
 
+    #[tracing::instrument]
     async fn list_pod_sandbox(
         &self,
         _: Request<ListPodSandboxRequest>,
     ) -> Result<Response<ListPodSandboxResponse>, Status> {
-        unimplemented!();
+        let reply = ListPodSandboxResponse {
+            items: self.storage.list_pod_sandboxes().map_err(|error| {
+                error!(?error, "failed listing sandboxes");
+                Status::internal("storage unavailable")
+            })?,
+        };
+
+        Ok(Response::new(reply))
     }
 
+    #[tracing::instrument]
     async fn pod_sandbox_status(
         &self,
-        _: Request<PodSandboxStatusRequest>,
+        request: Request<PodSandboxStatusRequest>,
     ) -> Result<Response<PodSandboxStatusResponse>, Status> {
-        unimplemented!();
+        let message = request.into_inner();
+
+        let status = self
+            .storage
+            .get_pod_sandbox_status(&message.pod_sandbox_id)
+            .map_err(|error| {
+                error!(?error, "failed finding sandbox");
+                Status::internal("storage unavailable")
+            })?;
+
+        let reply = PodSandboxStatusResponse {
+            status: Some(status),
+            ..Default::default()
+        };
+
+        Ok(Response::new(reply))
     }
 
+    #[tracing::instrument]
     async fn remove_pod_sandbox(
         &self,
         _: Request<RemovePodSandboxRequest>,
@@ -757,60 +813,91 @@ impl RuntimeService for RuntimeHandler {
         unimplemented!();
     }
 
+    #[tracing::instrument]
     async fn stop_pod_sandbox(
         &self,
         _: Request<StopPodSandboxRequest>,
     ) -> Result<Response<StopPodSandboxResponse>, Status> {
-        unimplemented!();
+        // TODO: stop containers associated with pod
+        Ok(Response::new(StopPodSandboxResponse {}))
     }
 
+    #[tracing::instrument]
     async fn run_pod_sandbox(
         &self,
-        _: Request<RunPodSandboxRequest>,
+        request: Request<RunPodSandboxRequest>,
     ) -> Result<Response<RunPodSandboxResponse>, Status> {
+        debug!("creating pod sandbox");
+        let message = request.into_inner();
+
+        let pod = self
+            .storage
+            .add_pod_sandbox(
+                &message
+                    .config
+                    .ok_or_else(|| Status::invalid_argument("config"))?,
+            )
+            .map_err(|error| {
+                error!(?error, "failed listing sandboxes");
+                Status::internal("storage unavailable")
+            })?;
+
+        // let reply = RunPodSandboxResponse {
+        //     pod_sandbox_id: random_id().map_err(|error| {
+        //         error!(?error, "rng failed");
+        //         Status::internal("unable to process")
+        //     })?,
+        // };
         let reply = RunPodSandboxResponse {
-            pod_sandbox_id: random_id().map_err(|error| {
-                error!(?error, "rng failed");
-                Status::internal("unable to process")
-            })?,
+            pod_sandbox_id: pod,
         };
 
         Ok(Response::new(reply))
     }
 }
 
+/// A container runtime based on PRoot
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Path to unix socket to listen. Defaults to ./proot.sock
+    #[arg(long)]
+    server: Option<String>,
+
+    /// Directory where container and images data will be stored
+    #[arg(short, long)]
+    storage: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt::init();
 
-    let root = std::env::args()
-        .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("Usage: android-proot-cri /path/to/storage"))?;
+    let args = Args::parse();
 
-    let binding = std::env::current_dir()?;
-    let cwd = binding
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("unable to get current working directory"))?;
+    let server_path = args
+        .server
+        .and_then(|s| Some(Path::new(&s).to_path_buf()))
+        .unwrap_or_else(|| {
+            let binding = std::env::current_dir().expect("unable to get current directory");
+            let cwd = binding
+                .to_str()
+                .expect("unable to get current working directory");
 
-    let parent = Path::new(cwd);
+            Path::new(cwd).join("proot.sock")
+        });
 
-    std::fs::create_dir_all(parent)?;
-
-    let path = parent.join("proot.sock");
-
-    debug!(sock = path.to_str(), "starting to listen...");
-
-    if path.exists() {
-        std::fs::remove_file(&path)?;
+    if server_path.exists() {
+        std::fs::remove_file(&server_path)?;
     }
 
-    let uds = UnixListener::bind(path.clone())?;
+    let uds = UnixListener::bind(server_path.clone())?;
 
-    info!(sock = path.to_str(), "started listener");
+    info!(sock = server_path.to_str(), "started listener");
 
     let uds_stream = UnixListenerStream::new(uds);
 
-    let storage = Storage::new(&root);
+    let storage = Storage::new(&args.storage);
     storage.init()?;
 
     let engine = Engine::new();
@@ -827,7 +914,11 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut term = signal(SignalKind::terminate())?;
 
     tokio::select! {
-        _ = server => {}
+        result = server => {
+            if let Err(error) = result {
+                error!(?error, "server returned error")
+            }
+        }
         _ = ctrl_c.recv() => {}
         _ = term.recv() => {}
     };

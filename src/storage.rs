@@ -3,6 +3,7 @@ use std::{
     fs::{self, File},
     io::{Read, Write as IoWrite},
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use anyhow::Context;
@@ -11,7 +12,10 @@ use rand::TryRngCore;
 use tracing::debug;
 
 use crate::{
-    cri::runtime::{Container, ContainerConfig, ContainerState, ContainerStatus},
+    cri::runtime::{
+        Container, ContainerConfig, ContainerState, ContainerStatus, PodSandbox, PodSandboxConfig,
+        PodSandboxNetworkStatus, PodSandboxState, PodSandboxStatus,
+    },
     utils::to_timestamp,
 };
 
@@ -54,10 +58,7 @@ impl RemoteImage {
 
         let (domain, repo) = match name.split_once("/") {
             Some((domain, name)) => (domain.to_string(), name.to_string()),
-            None => (
-                "registry-1.docker.io".to_string(),
-                format!("library/{}", name),
-            ),
+            None => ("registry.k8s.io".to_string(), format!("library/{}", name)),
         };
 
         let (repository, tag) = match repo.split_once(":") {
@@ -80,6 +81,7 @@ pub struct Storage {
     containers: PathBuf,
     images: PathBuf,
     layers: PathBuf,
+    pods: PathBuf,
 }
 
 // This implementation is designed to rely on file system as the underlying storage mechanism,
@@ -100,11 +102,13 @@ impl Storage {
         let containers = root_path.join("containers");
         let images = root_path.join("images");
         let layers = root_path.join("layers");
+        let pods = root_path.join("pods");
         Storage {
             root: root_path.to_path_buf(),
             containers,
             images,
             layers,
+            pods,
         }
     }
 
@@ -126,7 +130,15 @@ impl Storage {
             fs::create_dir_all(&self.layers)?;
         }
 
+        if !self.pods.exists() {
+            fs::create_dir_all(&self.pods)?;
+        }
+
         Ok(())
+    }
+
+    pub fn mountpoint(&self) -> PathBuf {
+        std::path::absolute(&self.root).expect("mountpoint")
     }
 
     pub fn list_containers(&self) -> Result<Vec<Container>, anyhow::Error> {
@@ -164,8 +176,6 @@ impl Storage {
                         pod_sandbox_id: String::new(),
                     };
 
-                    debug!(id = container.id, "found container");
-
                     containers.push(container);
                 }
             }
@@ -188,7 +198,11 @@ impl Storage {
             state = ContainerState::ContainerRunning;
         }
 
-        let created = path_to_container.metadata()?.created()?;
+        // TODO: rust android does not support creation time at the time
+        let created = path_to_container
+            .metadata()?
+            .created()
+            .unwrap_or_else(|_| SystemTime::now());
 
         Ok((state, to_timestamp(created)?))
     }
@@ -379,6 +393,106 @@ impl Storage {
         entries.sort_by(|(idx_a, _), (idx_b, _)| idx_a.cmp(idx_b));
 
         Ok(entries.into_iter().map(|(_, path)| path).collect())
+    }
+
+    /// list pod sandbox
+    pub fn list_pod_sandboxes(&self) -> Result<Vec<PodSandbox>, anyhow::Error> {
+        let mut pods = vec![];
+
+        for entry in self.pods.read_dir()? {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+
+                if path.is_dir() {
+                    let id = path
+                        .file_name()
+                        .expect("bug? unknown container path")
+                        .to_str()
+                        .expect("bug? container name has invalid chars")
+                        .to_string();
+
+                    // TODO: optimize memory allocations
+                    let mut buf: Vec<u8> = vec![];
+
+                    let mut file = File::open(path.join("spec.bin"))
+                        .context(format!("opening spec at {:?}", &path))?;
+                    file.read_to_end(&mut buf)?;
+
+                    let config: PodSandboxConfig = prost::Message::decode(&buf[..])
+                        .context(format!("decode podsandbox {:?}", &path))?;
+
+                    let created = to_timestamp(path.metadata()?.created()?)?;
+
+                    let pod = PodSandbox {
+                        id,
+                        state: PodSandboxState::SandboxReady.into(),
+                        labels: config.labels,
+                        metadata: config.metadata,
+                        annotations: config.annotations,
+                        created_at: created,
+                        runtime_handler: "".to_string(),
+                    };
+
+                    pods.push(pod);
+                }
+            }
+        }
+
+        Ok(pods)
+    }
+
+    pub fn get_pod_sandbox_status(&self, id: &String) -> Result<PodSandboxStatus, anyhow::Error> {
+        let path = self.pods.join(id);
+
+        // TODO: optimize memory allocations
+        let mut buf: Vec<u8> = vec![];
+
+        let mut file =
+            File::open(path.join("spec.bin")).context(format!("opening spec at {:?}", &path))?;
+        file.read_to_end(&mut buf)?;
+
+        let config: PodSandboxConfig =
+            prost::Message::decode(&buf[..]).context(format!("decode podsandbox {:?}", &path))?;
+
+        let created = to_timestamp(
+            path.metadata()?
+                .created()
+                .unwrap_or_else(|_| SystemTime::now()),
+        )?;
+
+        let status = PodSandboxStatus {
+            id: id.clone(),
+            annotations: config.annotations,
+            labels: config.labels,
+            metadata: config.metadata,
+            created_at: created,
+            state: PodSandboxState::SandboxReady.into(),
+            network: Some(PodSandboxNetworkStatus {
+                ip: "10.137.0.91".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        Ok(status)
+    }
+
+    /// add pod sandbox
+    pub fn add_pod_sandbox(&self, pod: &PodSandboxConfig) -> Result<String, anyhow::Error> {
+        let id = random_id()?;
+        let root = self.pods.join(&id);
+
+        if !root.exists() {
+            fs::create_dir_all(&root)?;
+        }
+
+        let mut buf = vec![];
+        pod.encode(&mut buf)?;
+
+        let mut file = File::create(root.join("spec.bin"))?;
+        file.write_all(&buf)?;
+
+        Ok(id)
     }
 
     pub fn build_image_layers_path(&self, image: &RemoteImage) -> PathBuf {

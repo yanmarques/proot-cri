@@ -3,9 +3,9 @@
     "name": "alpine"
   },
   "image": {
-    "image": "python"
+    "image": "registry-1.docker.io/library/python"
   },
-  "command": ["test-init", "4"],
+  "command": ["sleep", "INF"],
   "log_path": "alpine.0.log",
   "linux": {}
 }
