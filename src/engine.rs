@@ -40,10 +40,50 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Main method to create a new engine.
     pub fn new() -> Engine {
         Engine {
             ..Default::default()
         }
+    }
+
+    /// Try to wait for all running containers to exit, and collect their respective exit codes.
+    pub fn collect_exitcodes(&self) -> Vec<(String, i32)> {
+        let mut lock = self.containers.lock().expect("lock poisoned");
+        let ids = lock
+            .borrow_mut()
+            .iter()
+            .map(|(id, container)| (id.clone(), container.child.id()))
+            .collect::<Vec<(String, u32)>>();
+
+        // don't keep the lock, especially during the following multiple syscalls
+        drop(lock);
+
+        ids.into_iter()
+            .map(|(id, pid)| {
+                // wait for process to exit and return immediately otherwise
+                if let Ok(status) = nix::sys::wait::waitpid(
+                    Pid::from_raw(pid.try_into().expect("bug? pid is too large")),
+                    Some(WaitPidFlag::WNOHANG),
+                ) {
+                    match status {
+                        WaitStatus::Exited(_, code) => {
+                            return Some((id, code));
+                        }
+                        WaitStatus::Signaled(_, _, _) => {}
+                        WaitStatus::Stopped(_, _) => {}
+                        WaitStatus::PtraceEvent(_, _, _) => {}
+                        WaitStatus::PtraceSyscall(_) => {}
+                        WaitStatus::Continued(_) => {}
+                        WaitStatus::StillAlive => {}
+                    }
+                }
+
+                None
+            })
+            .filter(|a| a.is_some())
+            .map(|a| a.unwrap())
+            .collect()
     }
 
     /// Stop all existing containers and return all errors encountered along the way

@@ -634,6 +634,14 @@ impl RuntimeService for RuntimeHandler {
         &self,
         _: Request<ListContainersRequest>,
     ) -> Result<Response<ListContainersResponse>, Status> {
+        self.engine
+            .collect_exitcodes()
+            .iter()
+            .map(|(id, exit_code)| self.storage.save_container_exitcode(id, *exit_code))
+            .for_each(|error| {
+                error!(?error, "failed to save container exit code");
+            });
+
         let containers = self.storage.list_containers().map_err(|error| {
             let bt = Backtrace::capture();
             error!(?error, ?bt, "failed to list containers");
