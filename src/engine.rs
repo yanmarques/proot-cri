@@ -86,7 +86,7 @@ impl Engine {
         let container = lock
             .borrow_mut()
             .get_mut(id)
-            .ok_or_else(|| anyhow::anyhow!("unknown container"))?;
+            .ok_or_else(|| anyhow::anyhow!("unknown container: {id:?}"))?;
 
         let init_pid = container.init_pid;
         let proot_pid = container.child.id();

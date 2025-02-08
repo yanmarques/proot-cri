@@ -13,8 +13,8 @@ use tracing::debug;
 
 use crate::{
     cri::runtime::{
-        Container, ContainerConfig, ContainerState, ContainerStatus, PodSandbox, PodSandboxConfig,
-        PodSandboxNetworkStatus, PodSandboxState, PodSandboxStatus,
+        Container, ContainerConfig, ContainerState, ContainerStatus, Image, ImageSpec, PodSandbox,
+        PodSandboxConfig, PodSandboxNetworkStatus, PodSandboxState, PodSandboxStatus,
     },
     utils::to_timestamp,
 };
@@ -51,14 +51,17 @@ pub struct RemoteImage {
 
 impl RemoteImage {
     /// Parse remote image info from image name (e.g., public.ecr.aws/alpine:v3.19, alpine, etc.)
-    pub fn parse(name: String) -> Result<RemoteImage, anyhow::Error> {
+    pub fn parse(name: &String) -> Result<RemoteImage, anyhow::Error> {
         if name.len() == 0 {
             return Err(anyhow::anyhow!("invalid empty reference image string"));
         }
 
         let (domain, repo) = match name.split_once("/") {
             Some((domain, name)) => (domain.to_string(), name.to_string()),
-            None => ("registry.k8s.io".to_string(), format!("library/{}", name)),
+            None => (
+                "registry-1.docker.io".to_string(),
+                format!("library/{}", name),
+            ),
         };
 
         let (repository, tag) = match repo.split_once(":") {
@@ -71,6 +74,14 @@ impl RemoteImage {
             repository,
             tag,
         });
+    }
+}
+
+impl ToString for RemoteImage {
+    /// Return text representation of remote image.
+    /// Note: the returned string is not guaranteed to equal the original parsed string.
+    fn to_string(&self) -> String {
+        format!("{}/{}:{}", self.domain, self.repository, self.tag)
     }
 }
 
@@ -227,18 +238,41 @@ impl Storage {
         Ok(id)
     }
 
-    /// get status information of given container
-    pub fn get_container_status(&self, id: &String) -> Result<ContainerStatus, anyhow::Error> {
-        let path = self.containers.join(id);
+    /// Determines whether given container exists by its ID.
+    /// Returns a file system path to the container, if it exists.
+    pub fn has_container(&self, id: &String) -> Option<PathBuf> {
+        let root = self.build_container_path(id);
+        if root.exists() {
+            Some(root)
+        } else {
+            None
+        }
+    }
+
+    /// Get status information of given container. Returns `Ok(None)` if container does not exist.
+    pub fn get_container_status(
+        &self,
+        id: &String,
+    ) -> Result<Option<ContainerStatus>, anyhow::Error> {
+        let root = self.build_container_path(id);
+
+        if !root.exists() {
+            return Ok(None);
+        }
 
         let config = self.get_container_config(id)?;
 
-        let (state, created) = self.lookup_container_state_and_created_at(&path)?;
+        let (state, created) = self.lookup_container_state_and_created_at(&root)?;
 
-        let mut buf = [0; 4];
-        let mut file = File::open(self.build_container_path(id).join("exitcode"))?;
-        file.read(&mut buf)?;
-        let exit_code = i32::from_le_bytes(buf);
+        let exitcode_path = root.join("exitcode");
+        let mut exit_code = 0;
+
+        if exitcode_path.exists() {
+            let mut buf = [0; 4];
+            let mut file = File::open(exitcode_path)?;
+            file.read(&mut buf)?;
+            exit_code = i32::from_le_bytes(buf);
+        }
 
         let status = ContainerStatus {
             id: id.clone(),
@@ -246,7 +280,7 @@ impl Storage {
             exit_code,
             finished_at: 0,
             started_at: 0,
-            log_path: path.join("out.log").to_str().expect("log path").to_string(),
+            log_path: root.join("out.log").to_str().expect("log path").to_string(),
             message: String::new(),
             state: state.into(),
             image: config.image.clone(),
@@ -261,8 +295,10 @@ impl Storage {
             reason: String::new(),
         };
 
-        Ok(status)
+        Ok(Some(status))
     }
+
+    /// Get underlying container config. Returns error if given container does not exists.
     pub fn get_container_config(&self, id: &String) -> Result<ContainerConfig, anyhow::Error> {
         let path = self.containers.join(id);
 
@@ -298,6 +334,20 @@ impl Storage {
         Ok(())
     }
 
+    /// Find and return existing image. If image does not exist, returns `None`.
+    pub fn get_image(&self, digest: &String) -> Result<Option<Image>, anyhow::Error> {
+        let path = self.build_path_to_image(digest);
+
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let buf = fs::read(path.join("image.bin"))?;
+        let image: Image = prost::Message::decode(&buf[..])?;
+
+        Ok(Some(image))
+    }
+
     /// check whether the layer exists
     pub fn has_image_layer(&self, layer: &ImageLayer) -> bool {
         let layer_dir = self.build_image_layer_path(layer);
@@ -325,29 +375,63 @@ impl Storage {
         Ok(())
     }
 
-    // add image and associate with given existing layers,
-    // overwriting any existing image if needed
+    /// Add image and associate with given existing layers.
+    /// Returns `Ok(true)` if image already exists, and do not overwrite it.
     pub fn add_image(
         &self,
+        digest: &String,
         image: &RemoteImage,
         layers: &[ImageLayer],
     ) -> Result<bool, anyhow::Error> {
-        let mut exists = false;
-
-        let root = self.build_image_layers_path(&image);
+        let root = self.build_path_to_image(&digest);
+        let image_layers_path = self.build_path_to_image_layers(&digest);
 
         if root.exists() {
-            exists = true;
-        } else {
-            fs::create_dir_all(&root)?;
+            return Ok(true);
         }
 
+        fs::create_dir_all(&image_layers_path)?;
+
+        let spec = Image {
+            id: digest.clone(),
+            repo_tags: vec![image.to_string()],
+            size: 1,
+            ..Default::default()
+        };
+
+        let mut buf = vec![];
+        spec.encode(&mut buf)?;
+
+        let mut file = File::create(root.join("image.bin"))?;
+        file.write_all(&buf)?;
+        drop(file);
+
         for (idx, layer) in layers.iter().enumerate() {
-            let mut file = File::create(root.join(idx.to_string()))?;
+            let mut file = File::create(image_layers_path.join(idx.to_string()))?;
             file.write_all(layer.digest.as_bytes())?;
         }
 
-        Ok(exists)
+        Ok(false)
+    }
+
+    /// Return list of all stored images.
+    pub fn list_images(&self) -> Result<Vec<Image>, anyhow::Error> {
+        let mut images = vec![];
+
+        for entry in self.images.read_dir()? {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+
+                if path.is_dir() {
+                    let buf = fs::read(path.join("image.bin"))?;
+                    let image: Image = prost::Message::decode(&buf[..])?;
+
+                    images.push(image);
+                }
+            }
+        }
+
+        Ok(images)
     }
 
     // remove given image from storage if possible
@@ -360,10 +444,10 @@ impl Storage {
     }
 
     // get path to all images layers used by given image
-    pub fn image_layers(&self, image: &RemoteImage) -> Result<Vec<PathBuf>, anyhow::Error> {
-        let root = self.build_image_layers_path(image);
+    pub fn image_layers(&self, digest: &String) -> Result<Vec<PathBuf>, anyhow::Error> {
+        let root = self.build_path_to_image_layers(digest);
         if !root.exists() {
-            return Err(anyhow::anyhow!("unknown image: {image:?}"));
+            return Err(anyhow::anyhow!("unknown image: {digest:?}"));
         }
 
         let mut entries = vec![];
@@ -495,17 +579,26 @@ impl Storage {
         Ok(id)
     }
 
-    pub fn build_image_layers_path(&self, image: &RemoteImage) -> PathBuf {
-        self.images
-            .join(&image.domain)
-            .join(&image.repository)
-            .join("layers")
+    /// Build the file system path to the given image digest.
+    /// It assumes the image exists without performing any confirmation, it just builds the path.
+    pub fn build_path_to_image(&self, digest: &String) -> PathBuf {
+        self.images.join(&digest)
     }
 
+    /// Build the file system path to the private layers of the given image digest.
+    /// It assumes the image exists without performing any confirmation, it just builds the path.
+    pub fn build_path_to_image_layers(&self, digest: &String) -> PathBuf {
+        self.build_path_to_image(digest).join("layers")
+    }
+
+    /// Build the file system path to the container by the given ID.
+    /// It assumes the container exists without performing any confirmation, it just builds the path.
     pub fn build_container_path(&self, id: &String) -> PathBuf {
         self.containers.join(id)
     }
 
+    /// Build path to the given image layer. An image layer is a global file,
+    /// where all dependent images are associated.
     pub fn build_image_layer_path(&self, layer: &ImageLayer) -> PathBuf {
         self.layers.join(&layer.digest).join("layer.tar.gz")
     }

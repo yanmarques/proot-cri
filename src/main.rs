@@ -1,4 +1,4 @@
-use std::{collections::HashMap, error::Error, path::Path, time::Duration};
+use std::{backtrace::Backtrace, collections::HashMap, error::Error, path::Path, time::Duration};
 
 use clap::Parser;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -73,7 +73,6 @@ impl ImageService for ImageHandler {
         &self,
         _: Request<ImageFsInfoRequest>,
     ) -> Result<Response<ImageFsInfoResponse>, Status> {
-        debug!("image fs info");
         let reply = ImageFsInfoResponse {
             image_filesystems: vec![FilesystemUsage {
                 timestamp: timestamp().map_err(|error| {
@@ -124,13 +123,13 @@ impl ImageService for ImageHandler {
         &self,
         request: Request<PullImageRequest>,
     ) -> Result<Response<PullImageResponse>, Status> {
-        debug!("pull image");
         let message = request.into_inner();
+        debug!("pull image: {:?}", message);
         let reference = message
             .image
             .ok_or_else(|| Status::invalid_argument("image"))?;
 
-        let image = RemoteImage::parse(reference.image).map_err(|error| {
+        let image = RemoteImage::parse(&reference.image).map_err(|error| {
             error!(?error, "failed to parse remote image");
             Status::invalid_argument("invalid image")
         })?;
@@ -256,7 +255,7 @@ impl ImageService for ImageHandler {
                 (
                     reqwest::header::ACCEPT,
                     HeaderValue::from_static(
-                        "application/vnd.docker.distribution.manifest.v2+json",
+                        "application/vnd.docker.distribution.manifest.list.v2+json",
                     ),
                 ),
             ]))
@@ -269,16 +268,21 @@ impl ImageService for ImageHandler {
 
         let status = resp.status();
         debug!(status = ?status, "manifests response");
+        if !status.is_success() {
+            return Err(Status::invalid_argument("image"));
+        }
 
         let data = resp.json::<serde_json::Value>().await.map_err(|error| {
             error!(?error, "failed to parse json response from manifests");
             Status::internal("image unavailable")
         })?;
+        debug!(?data, "manifests body");
 
         let digest = data
             .get("manifests")
             .and_then(|v| v.as_array())
             .and_then(|m| {
+                debug!(length = m.len(), "manifests length");
                 for manifest in m {
                     if let Some(arch) = manifest.get("platform").and_then(|p| p.get("architecture"))
                     {
@@ -294,7 +298,16 @@ impl ImageService for ImageHandler {
 
                 return None;
             })
-            .ok_or_else(|| Status::internal("image unavailable"))?;
+            .ok_or_else(|| {
+                error!("unable to find manifest");
+                Status::internal("image unavailable")
+            })?;
+
+        if let Ok(Some(_)) = self.storage.get_image(&digest) {
+            let reply = PullImageResponse { image_ref: digest };
+
+            return Ok(Response::new(reply));
+        }
 
         //
         // fetch the layers
@@ -315,7 +328,9 @@ impl ImageService for ImageHandler {
                 (reqwest::header::AUTHORIZATION, auth_header.clone()),
                 (
                     reqwest::header::ACCEPT,
-                    HeaderValue::from_static("application/vnd.oci.image.manifest.v1+json"),
+                    HeaderValue::from_static(
+                        "application/vnd.docker.distribution.manifest.v2+json",
+                    ),
                 ),
             ]))
             .send()
@@ -327,6 +342,9 @@ impl ImageService for ImageHandler {
 
         let status = resp.status();
         debug!(status = ?status, "layers response");
+        if !status.is_success() {
+            return Err(Status::invalid_argument("image"));
+        }
 
         let data = resp.json::<serde_json::Value>().await.map_err(|error| {
             error!(?error, "failed to parse json response from layers");
@@ -406,15 +424,16 @@ impl ImageService for ImageHandler {
             }
         }
 
-        let exists = self.storage.add_image(&image, &g_layers).map_err(|error| {
-            error!(?error, "failed to store image");
-            Status::internal("image unavailable")
-        })?;
+        let exists = self
+            .storage
+            .add_image(&digest, &image, &g_layers)
+            .map_err(|error| {
+                error!(?error, "failed to store image");
+                Status::internal("storage failed")
+            })?;
         debug!(exists = exists, "image exists");
 
-        let reply = PullImageResponse {
-            image_ref: image.repository,
-        };
+        let reply = PullImageResponse { image_ref: digest };
 
         return Ok(Response::new(reply));
     }
@@ -425,27 +444,16 @@ impl ImageService for ImageHandler {
         request: Request<ImageStatusRequest>,
     ) -> Result<Response<ImageStatusResponse>, Status> {
         let message = request.into_inner();
+        debug!(image = ?message.image, "image status");
         let image = message
             .image
             .ok_or_else(|| Status::invalid_argument("image"))?;
 
-        let image = RemoteImage::parse(image.image).map_err(|error| {
-            error!(?error, "failed to parse image");
-            Status::invalid_argument("image")
-        })?;
-
         let reply = ImageStatusResponse {
-            image: Some(cri::runtime::Image {
-                id: image.repository.clone(),
-                size: 1,
-                username: "root".to_string(),
-                pinned: false,
-                spec: Some(ImageSpec {
-                    image: image.repository,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
+            image: self.storage.get_image(&image.image).map_err(|error| {
+                error!(?error, "failed to parse image");
+                Status::invalid_argument("image")
+            })?,
             ..Default::default()
         };
 
@@ -457,7 +465,12 @@ impl ImageService for ImageHandler {
         &self,
         _: Request<ListImagesRequest>,
     ) -> Result<Response<ListImagesResponse>, Status> {
-        let reply = ListImagesResponse { images: vec![] };
+        let reply = ListImagesResponse {
+            images: self.storage.list_images().map_err(|error| {
+                error!(?error, "failed to list images");
+                Status::internal("storage failed")
+            })?,
+        };
 
         Ok(Response::new(reply))
     }
@@ -470,12 +483,11 @@ impl RuntimeService for RuntimeHandler {
         &self,
         _: Request<VersionRequest>,
     ) -> Result<Response<VersionResponse>, Status> {
-        debug!("cri version");
         let reply = VersionResponse {
             version: "0.1.0".to_string(),
             runtime_api_version: "v1".to_string(),
-            runtime_name: "android-proot-cri".to_string(),
-            runtime_version: "v0.1.0".to_string(),
+            runtime_name: "containerd".to_string(),
+            runtime_version: "v2.0.1".to_string(),
         };
 
         Ok(Response::new(reply))
@@ -534,7 +546,6 @@ impl RuntimeService for RuntimeHandler {
         &self,
         _: Request<ListContainerStatsRequest>,
     ) -> Result<Response<ListContainerStatsResponse>, Status> {
-        debug!("container stats");
         let reply = ListContainerStatsResponse { stats: vec![] };
 
         Ok(Response::new(reply))
@@ -602,12 +613,16 @@ impl RuntimeService for RuntimeHandler {
             .storage
             .get_container_status(&message.container_id)
             .map_err(|error| {
-                error!(?error, "failed to list containers");
+                error!(
+                    ?error,
+                    container_id = message.container_id,
+                    "failed to list containers"
+                );
                 Status::internal("storage failed")
             })?;
 
         let reply = ContainerStatusResponse {
-            status: Some(status),
+            status,
             ..Default::default()
         };
 
@@ -620,7 +635,8 @@ impl RuntimeService for RuntimeHandler {
         _: Request<ListContainersRequest>,
     ) -> Result<Response<ListContainersResponse>, Status> {
         let containers = self.storage.list_containers().map_err(|error| {
-            error!(?error, "failed to list containers");
+            let bt = Backtrace::capture();
+            error!(?error, ?bt, "failed to list containers");
             Status::internal("storage failed")
         })?;
 
@@ -642,13 +658,10 @@ impl RuntimeService for RuntimeHandler {
         request: Request<StopContainerRequest>,
     ) -> Result<Response<StopContainerResponse>, Status> {
         let message = request.into_inner();
-        let _ = self
-            .storage
-            .get_container_config(&message.container_id)
-            .map_err(|error| {
-                error!(?error, "container not in storage");
-                Status::invalid_argument("unknown container")
-            })?;
+
+        if self.storage.has_container(&message.container_id).is_none() {
+            return Err(Status::invalid_argument("unknown container"));
+        }
 
         let timeout = if message.timeout > 0 {
             Some(Duration::from_secs(message.timeout.try_into().map_err(
@@ -685,7 +698,6 @@ impl RuntimeService for RuntimeHandler {
         &self,
         request: Request<StartContainerRequest>,
     ) -> Result<Response<StartContainerResponse>, Status> {
-        debug!("start container");
         let message = request.into_inner();
         let config = self
             .storage
@@ -695,19 +707,12 @@ impl RuntimeService for RuntimeHandler {
                 Status::invalid_argument("unknown container")
             })?;
 
-        let image = {
-            let image_spec = config
-                .image
-                .clone()
-                .ok_or_else(|| Status::internal("unknown container"))?;
+        let image = config
+            .image
+            .as_ref()
+            .ok_or_else(|| Status::internal("unknown container"))?;
 
-            RemoteImage::parse(image_spec.image).map_err(|error| {
-                error!(?error, "failed parsing image");
-                Status::internal("unknown container")
-            })?
-        };
-
-        let layers = self.storage.image_layers(&image).map_err(|error| {
+        let layers = self.storage.image_layers(&image.image).map_err(|error| {
             error!(?error, "image layers unavailable");
             Status::invalid_argument("layers error")
         })?;
@@ -739,7 +744,7 @@ impl RuntimeService for RuntimeHandler {
         Ok(Response::new(StartContainerResponse {}))
     }
 
-    #[tracing::instrument]
+    // #[tracing::instrument]
     async fn create_container(
         &self,
         request: Request<CreateContainerRequest>,
@@ -749,13 +754,26 @@ impl RuntimeService for RuntimeHandler {
             .config
             .ok_or_else(|| Status::invalid_argument("config"))?;
 
-        ImageHandler::new(self.storage.clone())
-            .pull_image(Request::new(PullImageRequest {
-                image: config.image.clone(),
-                auth: None,
-                sandbox_config: None,
-            }))
-            .await?;
+        let image = config
+            .image
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("image"))?;
+
+        // ensure image exists
+        self.storage
+            .get_image(&image.image)
+            .map_err(|error| {
+                error!(?error, ?image, "unknown image");
+                Status::invalid_argument("image")
+            })?
+            .ok_or_else(|| Status::invalid_argument("image"))?;
+        // ImageHandler::new(self.storage.clone())
+        //     .pull_image(Request::new(PullImageRequest {
+        //         image: config.image.clone(),
+        //         auth: None,
+        //         sandbox_config: None,
+        //     }))
+        //     .await?;
 
         let id = self.storage.add_container(&config).map_err(|error| {
             error!(?error, "failed storing container");
@@ -827,7 +845,6 @@ impl RuntimeService for RuntimeHandler {
         &self,
         request: Request<RunPodSandboxRequest>,
     ) -> Result<Response<RunPodSandboxResponse>, Status> {
-        debug!("creating pod sandbox");
         let message = request.into_inner();
 
         let pod = self
@@ -906,6 +923,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let image = ImageHandler::new(storage.clone());
 
     let server = Server::builder()
+        .tcp_keepalive(Some(Duration::from_secs(2)))
         .add_service(RuntimeServiceServer::new(runtime))
         .add_service(ImageServiceServer::new(image))
         .serve_with_incoming(uds_stream);
