@@ -1,5 +1,5 @@
 use std::{
-    fmt::Write as FmtWrite,
+    fmt::{self, Write as FmtWrite},
     fs::{self, File},
     io::{Read, Write as IoWrite},
     path::{Path, PathBuf},
@@ -9,13 +9,13 @@ use std::{
 use anyhow::Context;
 use prost::{bytes::Buf, Message};
 use rand::TryRngCore;
-use tracing::debug;
 
 use crate::{
     cri::runtime::{
         Container, ContainerConfig, ContainerState, ContainerStatus, Image, ImageSpec, PodSandbox,
         PodSandboxConfig, PodSandboxNetworkStatus, PodSandboxState, PodSandboxStatus,
     },
+    errors::StorageError,
     utils::to_timestamp,
 };
 
@@ -106,21 +106,20 @@ pub struct Storage {
 //   layers
 //    \_ abcdef....tar.gz
 //
-
 impl Storage {
-    pub fn new(root: &str) -> Storage {
-        let root_path = Path::new(root);
+    pub fn new(root: &str) -> Result<Storage, anyhow::Error> {
+        let root_path = std::path::absolute(Path::new(root))?;
         let containers = root_path.join("containers");
         let images = root_path.join("images");
         let layers = root_path.join("layers");
         let pods = root_path.join("pods");
-        Storage {
+        Ok(Storage {
             root: root_path.to_path_buf(),
             containers,
             images,
             layers,
             pods,
-        }
+        })
     }
 
     /// initialize storage
@@ -257,7 +256,7 @@ impl Storage {
         let root = self.build_container_path(id);
 
         if !root.exists() {
-            return Ok(None);
+            return Err(anyhow::anyhow!(StorageError::ContainerNotFound(id.clone())));
         }
 
         let config = self.get_container_config(id)?;
@@ -274,13 +273,15 @@ impl Storage {
             exit_code = i32::from_le_bytes(buf);
         }
 
+        let log_path = root.join("out.log").to_str().expect("log path").to_string();
+
         let status = ContainerStatus {
             id: id.clone(),
+            log_path,
             created_at: created,
             exit_code,
             finished_at: 0,
             started_at: 0,
-            log_path: root.join("out.log").to_str().expect("log path").to_string(),
             message: String::new(),
             state: state.into(),
             image: config.image.clone(),
@@ -313,6 +314,27 @@ impl Storage {
             prost::Message::decode(&buf[..]).context(format!("decode container {:?}", &path))?;
 
         Ok(config)
+    }
+
+    /// Delete all files associated with given container ID if it exists. If the container does not
+    /// exist, returns `Ok(None)`
+    pub fn remove_container(&self, id: &String) -> Result<(), anyhow::Error> {
+        if let Some(root) = self.has_container(id) {
+            fs::remove_dir_all(root)?;
+            Ok(())
+        } else {
+            anyhow::bail!(StorageError::ContainerNotFound(id.clone()))
+        }
+    }
+
+    /// Truncate the log file of the given container, if it exists.
+    pub fn reopen_container_log(&self, id: &String) -> Result<(), anyhow::Error> {
+        if let Some(root) = self.has_container(id) {
+            fs::write(root.join("out.log"), &[])?;
+            Ok(())
+        } else {
+            anyhow::bail!(StorageError::ContainerNotFound(id.clone()))
+        }
     }
 
     /// save exit code of given container and removes

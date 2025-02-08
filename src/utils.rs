@@ -1,6 +1,13 @@
 use std::{
     collections::HashMap,
+    fs::{self, FileType},
+    path::Path,
     time::{SystemTime, UNIX_EPOCH},
+};
+
+use nix::{
+    sys::wait::{WaitPidFlag, WaitStatus},
+    unistd::Pid,
 };
 
 /// Parse "WWW-Authenticate" header format
@@ -33,4 +40,50 @@ pub fn to_timestamp(source: SystemTime) -> Result<i64, anyhow::Error> {
 pub fn timestamp() -> Result<i64, anyhow::Error> {
     let now = SystemTime::now();
     to_timestamp(now)
+}
+
+/// Recursively copy all files from `src` to `dest`.
+pub fn copy_dir_all<S, D>(src: S, dest: D) -> Result<(), anyhow::Error>
+where
+    S: AsRef<Path>,
+    D: AsRef<Path>,
+{
+    fs::create_dir_all(&dest)?;
+
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+
+        let file_type = entry.file_type()?;
+
+        // TODO: copy symbolic links
+        if file_type.is_dir() {
+            copy_dir_all(&entry.path(), &dest.as_ref().join(entry.file_name()))?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), dest.as_ref().join(entry.file_name()))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Attempts to collect the exitcode of the process id to exit and return immediately otherwise
+pub fn try_wait_pid(pid: i32) -> Option<i32> {
+    if let Ok(status) = nix::sys::wait::waitpid(
+        Pid::from_raw(pid.try_into().expect("bug? pid is too large")),
+        Some(WaitPidFlag::WNOHANG),
+    ) {
+        match status {
+            WaitStatus::Exited(_, code) => {
+                return Some(code);
+            }
+            WaitStatus::Signaled(_, _, _) => {}
+            WaitStatus::Stopped(_, _) => {}
+            WaitStatus::PtraceEvent(_, _, _) => {}
+            WaitStatus::PtraceSyscall(_) => {}
+            WaitStatus::Continued(_) => {}
+            WaitStatus::StillAlive => {}
+        }
+    }
+
+    None
 }

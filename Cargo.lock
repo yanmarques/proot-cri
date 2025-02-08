@@ -41,6 +41,7 @@ dependencies = [
  "serde_json",
  "tar",
  "tempfile",
+ "thiserror",
  "tokio",
  "tokio-stream",
  "tonic",

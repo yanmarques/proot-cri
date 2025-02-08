@@ -3,25 +3,19 @@ use std::{
     collections::HashMap,
     fs::{self, File},
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
-    thread::sleep,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
 use anyhow::Context;
 use flate2::read::GzDecoder;
-use nix::{
-    sys::{
-        signal::Signal,
-        wait::{WaitPidFlag, WaitStatus},
-    },
-    unistd::Pid,
-};
+use nix::{sys::signal::Signal, unistd::Pid};
+use tokio::sync::RwLock;
 use tracing::debug;
 
-use crate::cri::runtime::ContainerConfig;
+use crate::{cri::runtime::ContainerConfig, utils};
 
 /// Holds the proot process that run the container
 #[derive(Debug)]
@@ -36,7 +30,7 @@ pub struct PRootProc {
 /// Container engine
 #[derive(Debug, Default, Clone)]
 pub struct Engine {
-    containers: Arc<Mutex<HashMap<String, PRootProc>>>,
+    containers: Arc<RwLock<HashMap<String, PRootProc>>>,
 }
 
 impl Engine {
@@ -47,9 +41,11 @@ impl Engine {
         }
     }
 
-    /// Try to wait for all running containers to exit, and collect their respective exit codes.
-    pub fn collect_exitcodes(&self) -> Vec<(String, i32)> {
-        let mut lock = self.containers.lock().expect("lock poisoned");
+    /// Attempts to collect the exit code of all running containers. It does not hang waiting for
+    /// any container to exit, only containers that already exited will be collected. All
+    /// containers that exited are removed from the internal list of running containers.
+    pub async fn try_wait_all_containers(&self) -> Vec<(String, i32)> {
+        let mut lock = self.containers.read().await;
         let ids = lock
             .borrow_mut()
             .iter()
@@ -59,58 +55,76 @@ impl Engine {
         // don't keep the lock, especially during the following multiple syscalls
         drop(lock);
 
-        ids.into_iter()
+        let ids: Vec<(String, i32)> = ids
+            .into_iter()
             .map(|(id, pid)| {
-                // wait for process to exit and return immediately otherwise
-                if let Ok(status) = nix::sys::wait::waitpid(
-                    Pid::from_raw(pid.try_into().expect("bug? pid is too large")),
-                    Some(WaitPidFlag::WNOHANG),
-                ) {
-                    match status {
-                        WaitStatus::Exited(_, code) => {
-                            return Some((id, code));
-                        }
-                        WaitStatus::Signaled(_, _, _) => {}
-                        WaitStatus::Stopped(_, _) => {}
-                        WaitStatus::PtraceEvent(_, _, _) => {}
-                        WaitStatus::PtraceSyscall(_) => {}
-                        WaitStatus::Continued(_) => {}
-                        WaitStatus::StillAlive => {}
-                    }
+                if let Some(exitcode) =
+                    utils::try_wait_pid(pid.try_into().expect("bug? pid is too large"))
+                {
+                    Some((id, exitcode))
+                } else {
+                    None
                 }
-
-                None
             })
             .filter(|a| a.is_some())
             .map(|a| a.unwrap())
-            .collect()
+            .collect();
+
+        // remove containers that exited
+        let mut lock = self.containers.write().await;
+        for (id, _) in ids.iter() {
+            drop(lock.borrow_mut().remove(id));
+        }
+
+        ids
+    }
+
+    /// Attempts to collect the exit code of the container. If we are able to collect the container
+    /// exit code, it is removed from the internal list of running containers.
+    pub async fn try_wait(&self, id: &String) -> Option<i32> {
+        let mut lock = self.containers.read().await;
+        let container = lock.borrow_mut().get(id)?;
+
+        let pid = container.child.id();
+
+        // don't keep the lock, especially during the following multiple syscalls
+        drop(lock);
+
+        if let Some(exitcode) = utils::try_wait_pid(pid.try_into().expect("bug? pid is too large"))
+        {
+            // remove containers that exited
+            let mut lock = self.containers.write().await;
+            drop(lock.borrow_mut().remove(id));
+
+            Some(exitcode)
+        } else {
+            None
+        }
     }
 
     /// Stop all existing containers and return all errors encountered along the way
-    pub fn shutdown(self) -> Vec<(String, Result<i32, anyhow::Error>)> {
-        let mut lock = self.containers.lock().expect("lock poisoned");
-        lock.borrow_mut()
-            .iter_mut()
-            .map(|(id, container)| {
-                let init_pid = container.init_pid;
-                let proot_pid = container.child.id();
+    pub async fn shutdown(self) -> Vec<(String, Result<i32, anyhow::Error>)> {
+        let mut exitcodes = vec![];
 
-                // close stdin to avoid deadlock
-                drop(container.child.stdin.take());
+        let mut lock = self.containers.write().await;
+        for (id, container) in lock.borrow_mut().iter_mut() {
+            let init_pid = container.init_pid;
+            let proot_pid = container.child.id();
 
-                match self.check_zombie_process(container) {
-                    Ok(None) => {}
-                    Ok(Some(exitcode)) => {
-                        return (id.clone(), Ok(exitcode));
-                    }
-                    Err(error) => {
-                        return (id.clone(), Err(error));
-                    }
-                };
+            // close stdin to avoid deadlock
+            drop(container.child.stdin.take());
 
-                (id.clone(), self.inner_stop(init_pid, proot_pid, id, None))
-            })
-            .collect()
+            let (id, exitcode) = {
+                match self.check_zombie_process(container.init_pid, container.child.id()) {
+                    None => (id.clone(), self.inner_stop(init_pid, proot_pid, None).await),
+                    Some(exitcode) => (id.clone(), Ok(exitcode)),
+                }
+            };
+
+            exitcodes.push((id, exitcode));
+        }
+
+        exitcodes
     }
 
     // Stop an existing container
@@ -121,8 +135,8 @@ impl Engine {
     // The way implemented is simpler. We first obtain the process id of the init process, and
     // store it in the `PRootProc.init_pid` attribute. Next, we send a SIGTERM to the init process.
     // Finally, we obtain the exit code of the init process through the exit code of proot.
-    pub fn stop(&self, id: &String, timeout: Option<Duration>) -> Result<i32, anyhow::Error> {
-        let mut lock = self.containers.lock().expect("lock poisoned");
+    pub async fn stop(&self, id: &String, timeout: Option<Duration>) -> Result<i32, anyhow::Error> {
+        let mut lock = self.containers.write().await;
         let container = lock
             .borrow_mut()
             .get_mut(id)
@@ -134,37 +148,33 @@ impl Engine {
         // close stdin to avoid deadlock
         drop(container.child.stdin.take());
 
-        match self.check_zombie_process(container) {
-            Ok(None) => {}
-            Ok(Some(exitcode)) => {
-                drop(lock.borrow_mut().remove(id));
-                return Ok(exitcode);
-            }
-            Err(error) => {
-                drop(lock.borrow_mut().remove(id));
-                return Err(error);
-            }
-        };
-
         // don't keep the lock while trying to and for the container process to wait
         drop(lock);
 
-        self.inner_stop(init_pid, proot_pid, id, timeout)
+        let result = self.inner_stop(init_pid, proot_pid, timeout).await;
+
+        let mut lock = self.containers.write().await;
+        drop(lock.borrow_mut().remove(id));
+        drop(lock);
+
+        result
     }
 
-    fn inner_stop(
+    async fn inner_stop(
         &self,
         init_pid: u32,
         proot_pid: u32,
-        id: &String,
         timeout: Option<Duration>,
     ) -> Result<i32, anyhow::Error> {
         // TODO: also check proot process stopped
+        if let Some(code) = self.check_zombie_process(init_pid, proot_pid) {
+            return Ok(code);
+        }
 
         debug!(?init_pid, "stopping container");
 
         // process id of proot
-        let proot_pid = Pid::from_raw(proot_pid.try_into().expect("bug? pid is too large"));
+        let proot_pid: i32 = proot_pid.try_into().expect("bug? pid is too large");
 
         //
         // attempt to stop container process gracefully
@@ -186,21 +196,10 @@ impl Engine {
         let mut exited = false;
 
         loop {
-            // wait for pid to exit non-block - similar to the `try_wait()` implementation
-            if let Ok(status) = nix::sys::wait::waitpid(proot_pid, Some(WaitPidFlag::WNOHANG)) {
-                match status {
-                    WaitStatus::Exited(_, code) => {
-                        exitcode = code;
-                        exited = true;
-                        break;
-                    }
-                    WaitStatus::Signaled(_, _, _) => {}
-                    WaitStatus::Stopped(_, _) => {}
-                    WaitStatus::PtraceEvent(_, _, _) => {}
-                    WaitStatus::PtraceSyscall(_) => {}
-                    WaitStatus::Continued(_) => {}
-                    WaitStatus::StillAlive => {}
-                }
+            if let Some(code) = utils::try_wait_pid(proot_pid) {
+                exitcode = code;
+                exited = true;
+                break;
             }
 
             let elapsed = now.elapsed()?;
@@ -208,17 +207,13 @@ impl Engine {
                 break;
             }
 
-            sleep(Duration::from_millis(200));
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-
-        let mut lock = self.containers.lock().expect("lock poisoned");
-        drop(lock.borrow_mut().remove(id));
-        drop(lock);
 
         if !exited {
             // the processes did not exited yet
             // we have to SIGKILL proot process, which will send a SIGKILL to the init process
-            nix::sys::signal::kill(proot_pid, Signal::SIGKILL)?;
+            nix::sys::signal::kill(Pid::from_raw(proot_pid), Signal::SIGKILL)?;
         }
 
         debug!(exitcode, "container stopped");
@@ -226,33 +221,23 @@ impl Engine {
         Ok(exitcode)
     }
 
-    fn check_zombie_process(
-        &self,
-        container: &mut PRootProc,
-    ) -> Result<Option<i32>, anyhow::Error> {
-        if container.init_pid == 0 {
-            // avoid a zombie proot process
-            if let Ok(Some(status)) = container.child.try_wait() {
-                if let Some(exitcode) = status.code() {
-                    return Ok(Some(exitcode));
-                }
-            }
-
-            return Err(anyhow::anyhow!("container failed to start"));
+    fn check_zombie_process(&self, init_pid: u32, proot_pid: u32) -> Option<i32> {
+        if init_pid == 0 {
+            utils::try_wait_pid(proot_pid.try_into().expect("bug? proot pid is too large"))
+        } else {
+            None
         }
-
-        Ok(None)
     }
 
-    // Start a ne container
-    pub fn spawn(
+    /// Start a new container
+    pub async fn spawn(
         &self,
         id: &String,
         config: &ContainerConfig,
         container_dir: PathBuf,
         image_layers: Vec<PathBuf>,
     ) -> Result<(u32, u32), anyhow::Error> {
-        let mut lock = self.containers.lock().expect("lock poisoned");
+        let mut lock = self.containers.read().await;
         if lock.borrow_mut().get(id).is_some() {
             return Err(anyhow::anyhow!("container already exists"));
         }
@@ -261,27 +246,6 @@ impl Engine {
         let mut args: Vec<String> = vec![];
 
         let root = container_dir.join("mounts").join("root");
-        args.push("-r".to_string());
-        args.push(root.to_str().expect("root directory").to_string());
-
-        // TODO: mount a private /dev/ and /proc/
-        args.push("-b".to_string());
-        args.push("/dev/".to_string());
-        args.push("-b".to_string());
-        args.push("/proc/".to_string());
-
-        //
-        args.push("--kill-on-exit".to_string());
-
-        args.push("-w".to_string());
-        if config.working_dir == "" {
-            args.push("/".to_string());
-        } else {
-            args.push(config.working_dir.clone());
-        }
-
-        args.extend_from_slice(&config.command);
-        args.extend_from_slice(&config.args);
 
         //
         // extract the image, if container is new
@@ -321,6 +285,73 @@ impl Engine {
             }
         }
 
+        args.push("-r".to_string());
+        args.push(root.to_str().expect("root directory").to_string());
+
+        // TODO: mount a private /dev/ and /proc/
+        args.push("-b".to_string());
+        args.push("/dev/".to_string());
+        args.push("-b".to_string());
+        args.push("/proc/".to_string());
+
+        for mount in config.mounts.iter() {
+            let host_path = Path::new(&mount.host_path);
+            let container_path = Path::new(&mount.container_path);
+
+            // file system path to the container real file
+            let full_path = root.join(container_path.strip_prefix("/")?);
+
+            // TODO: support readonly by copying the existing files directory to the container
+            if host_path.exists() {
+                if host_path.is_dir() {
+                    utils::copy_dir_all(&host_path, &full_path)?;
+                } else {
+                    let parent = full_path
+                        .parent()
+                        .expect("bug? container path does not have parent");
+
+                    fs::create_dir_all(parent).context("failed creating parent directory")?;
+
+                    fs::copy(&host_path, &full_path)?;
+                }
+            } else {
+                fs::create_dir_all(&full_path)?;
+            }
+
+            // if !host_path.exists() {
+            //     fs::create_dir_all(&host_path)
+            //         .context("failed creating missing host path: {}")
+            //         .context(format!("{:?}", host_path))?;
+            // }
+            //
+            // // ensure destination don't already exist for the symbolic link to work correctly.
+            // if full_path.exists() {
+            //     if full_path.is_dir() {
+            //         debug!(?full_path, "full container dir");
+            //         fs::remove_dir_all(&full_path)
+            //             .context("failed removing existing container dir")?;
+            //     } else {
+            //         fs::remove_file(&full_path)
+            //             .context("failed removing existing container file")?;
+            //     }
+            // }
+
+            // std::os::unix::fs::symlink(host_path, full_path).context("failed symlinking mount")?;
+        }
+
+        //
+        args.push("--kill-on-exit".to_string());
+
+        args.push("-w".to_string());
+        if config.working_dir == "" {
+            args.push("/".to_string());
+        } else {
+            args.push(config.working_dir.clone());
+        }
+
+        args.extend_from_slice(&config.command);
+        args.extend_from_slice(&config.args);
+
         let mut write_init_pid = tempfile::NamedTempFile::new()?;
 
         // reasonable default environment vars, all those seem to be required to many programs
@@ -329,7 +360,10 @@ impl Engine {
             ("HOME", "/"),
             ("SHELL", "/bin/sh"),
             ("TERM", "xterm"),
+            #[cfg(target_os = "android")]
             ("PROOT_TMP_DIR", "/data/local/tmp"),
+            #[cfg(target_os = "linux")]
+            ("PROOT_TMP_DIR", "/tmp"),
             (
                 "PROOT_WRITE_INIT_PID",
                 write_init_pid.path().to_str().expect("tempfile failed"),
@@ -345,7 +379,7 @@ impl Engine {
         debug!(?args, "cmd args");
 
         // TODO: do not inherit stdin, when needed, allocate a new pty for the container
-        let mut container = Command::new("./proot")
+        let container = Command::new("./proot")
             .args(args)
             .env_clear()
             .envs(default_envs)
@@ -356,14 +390,6 @@ impl Engine {
             .spawn()?;
 
         debug!(pid = container.id(), "spawned");
-
-        // opportunity checking: identify if the process promptly exists
-        if let Ok(result) = container.try_wait() {
-            if let Some(exitcode) = result {
-                debug!(?exitcode, "process exited");
-                return Err(anyhow::anyhow!("container exited"));
-            }
-        }
 
         //
         // proot does not handle gracefully shutting down child processes because of ptrace (I guess)
@@ -396,7 +422,7 @@ impl Engine {
 
         let proot_pid = container.id();
 
-        let mut lock = self.containers.lock().expect("lock poisoned");
+        let mut lock = self.containers.write().await;
         lock.borrow_mut().insert(
             id.clone(),
             PRootProc {

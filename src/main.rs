@@ -1,4 +1,6 @@
-use std::{backtrace::Backtrace, collections::HashMap, error::Error, path::Path, time::Duration};
+use std::{
+    backtrace::Backtrace, collections::HashMap, error::Error, path::Path, sync::Arc, time::Duration,
+};
 
 use clap::Parser;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -34,10 +36,12 @@ use cri::runtime::{
 use engine::Engine;
 use storage::{ImageLayer, RemoteImage, Storage};
 use tracing::{debug, error, info};
+use tracing_subscriber::{util::SubscriberInitExt, EnvFilter};
 use utils::{parse_www_authenticate, timestamp};
 
 mod cri;
 mod engine;
+mod errors;
 mod storage;
 mod utils;
 
@@ -45,9 +49,12 @@ const CRI_USER_AGENT: &'static str = "android-proot-cri";
 
 #[derive(Debug)]
 pub struct RuntimeHandler {
-    storage: Storage,
+    storage: Arc<Storage>,
     engine: Engine,
 }
+
+unsafe impl Send for RuntimeHandler {}
+unsafe impl Sync for RuntimeHandler {}
 
 #[derive(Debug)]
 pub struct ImageHandler {
@@ -56,7 +63,10 @@ pub struct ImageHandler {
 
 impl RuntimeHandler {
     fn new(storage: Storage, engine: Engine) -> RuntimeHandler {
-        RuntimeHandler { storage, engine }
+        RuntimeHandler {
+            storage: Arc::new(storage),
+            engine,
+        }
     }
 }
 
@@ -591,9 +601,22 @@ impl RuntimeService for RuntimeHandler {
 
     async fn reopen_container_log(
         &self,
-        _: Request<ReopenContainerLogRequest>,
+        request: Request<ReopenContainerLogRequest>,
     ) -> Result<Response<ReopenContainerLogResponse>, Status> {
-        unimplemented!();
+        let message = request.into_inner();
+
+        self.storage
+            .reopen_container_log(&message.container_id)
+            .map_err(|error| {
+                error!(
+                    ?error,
+                    container_id = message.container_id,
+                    "failed to reopen container log"
+                );
+                Status::internal("storage failed")
+            })?;
+
+        Ok(Response::new(ReopenContainerLogResponse {}))
     }
 
     async fn update_container_resources(
@@ -609,6 +632,19 @@ impl RuntimeService for RuntimeHandler {
     ) -> Result<Response<ContainerStatusResponse>, Status> {
         let message = request.into_inner();
 
+        if let Some(exitcode) = self.engine.try_wait(&message.container_id).await {
+            self.storage
+                .save_container_exitcode(&message.container_id, exitcode)
+                .map_err(|error| {
+                    error!(
+                        ?error,
+                        container_id = message.container_id,
+                        "failed to save container exit code"
+                    );
+                    Status::internal("storage failed")
+                })?;
+        }
+
         let status = self
             .storage
             .get_container_status(&message.container_id)
@@ -620,6 +656,8 @@ impl RuntimeService for RuntimeHandler {
                 );
                 Status::internal("storage failed")
             })?;
+
+        debug!(?status, "container status");
 
         let reply = ContainerStatusResponse {
             status,
@@ -635,11 +673,13 @@ impl RuntimeService for RuntimeHandler {
         _: Request<ListContainersRequest>,
     ) -> Result<Response<ListContainersResponse>, Status> {
         self.engine
-            .collect_exitcodes()
+            .try_wait_all_containers()
+            .await
             .iter()
-            .map(|(id, exit_code)| self.storage.save_container_exitcode(id, *exit_code))
-            .for_each(|error| {
-                error!(?error, "failed to save container exit code");
+            .for_each(|(id, exit_code)| {
+                if let Err(error) = self.storage.save_container_exitcode(id, *exit_code) {
+                    error!(?error, "failed to save container exit code");
+                }
             });
 
         let containers = self.storage.list_containers().map_err(|error| {
@@ -655,12 +695,18 @@ impl RuntimeService for RuntimeHandler {
 
     async fn remove_container(
         &self,
-        _: Request<RemoveContainerRequest>,
+        request: Request<RemoveContainerRequest>,
     ) -> Result<Response<RemoveContainerResponse>, Status> {
-        unimplemented!();
+        let message = request.into_inner();
+
+        if let Err(error) = self.storage.remove_container(&message.container_id) {
+            error!(?error, "failed to remove container");
+        }
+
+        Ok(Response::new(RemoveContainerResponse {}))
     }
 
-    #[tracing::instrument]
+    // #[tracing::instrument]
     async fn stop_container(
         &self,
         request: Request<StopContainerRequest>,
@@ -668,13 +714,13 @@ impl RuntimeService for RuntimeHandler {
         let message = request.into_inner();
 
         if self.storage.has_container(&message.container_id).is_none() {
-            return Err(Status::invalid_argument("unknown container"));
+            return Ok(Response::new(StopContainerResponse {}));
         }
 
         let timeout = if message.timeout > 0 {
             Some(Duration::from_secs(message.timeout.try_into().map_err(
                 |error| {
-                    error!(?error, "stop timeout is too large?");
+                    error!(?error, timeout = ?message.timeout, "stop timeout is too large?");
                     Status::invalid_argument("stop timeout")
                 },
             )?))
@@ -682,21 +728,28 @@ impl RuntimeService for RuntimeHandler {
             None
         };
 
-        let exitcode = self
-            .engine
-            .stop(&message.container_id, timeout)
-            .map_err(|error| {
-                let bt = std::backtrace::Backtrace::capture();
-                error!(?error, ?bt, "failed to start container");
-                Status::internal("engine error")
-            })?;
-
-        self.storage
-            .save_container_exitcode(&message.container_id, exitcode)
-            .map_err(|error| {
-                error!(?error, "failed to save container's exitcode");
-                Status::internal("storage error")
-            })?;
+        match self.engine.stop(&message.container_id, timeout).await {
+            Ok(exitcode) => {
+                if let Err(error) = self
+                    .storage
+                    .save_container_exitcode(&message.container_id, exitcode)
+                {
+                    error!(
+                        ?error,
+                        exitcode,
+                        container = message.container_id,
+                        "failed to save container exitcode"
+                    );
+                }
+            }
+            Err(error) => {
+                error!(
+                    ?error,
+                    container = message.container_id,
+                    "failed to stop container"
+                );
+            }
+        };
 
         Ok(Response::new(StopContainerResponse {}))
     }
@@ -733,21 +786,21 @@ impl RuntimeService for RuntimeHandler {
                 self.storage.build_container_path(&message.container_id),
                 layers,
             )
+            .await
             .map_err(|error| {
                 let bt = std::backtrace::Backtrace::capture();
                 error!(?error, ?bt, "failed to start container");
                 Status::internal("engine error")
             })?;
 
-        self.storage
-            .save_container_pid(&message.container_id, pid)
-            .map_err(|error| {
-                error!(?error, "failed to save container's pid");
-                self.engine
-                    .stop(&message.container_id, None)
-                    .expect("could not save container pid, then could not stop the container");
-                Status::internal("engine error")
-            })?;
+        if let Err(error) = self.storage.save_container_pid(&message.container_id, pid) {
+            error!(?error, "failed to save container's pid");
+            self.engine
+                .stop(&message.container_id, None)
+                .await
+                .expect("could not save container pid, then could not stop the container");
+            return Err(Status::internal("engine error"));
+        }
 
         Ok(Response::new(StartContainerResponse {}))
     }
@@ -896,7 +949,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt::Subscriber::builder()
+        .with_line_number(true)
+        .with_env_filter(EnvFilter::from_default_env())
+        .finish()
+        .try_init()?;
 
     let args = Args::parse();
 
@@ -922,7 +979,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let uds_stream = UnixListenerStream::new(uds);
 
-    let storage = Storage::new(&args.storage);
+    let storage = Storage::new(&args.storage)?;
     storage.init()?;
 
     let engine = Engine::new();
@@ -930,28 +987,24 @@ async fn main() -> Result<(), anyhow::Error> {
     let runtime = RuntimeHandler::new(storage.clone(), engine.clone());
     let image = ImageHandler::new(storage.clone());
 
-    let server = Server::builder()
-        .tcp_keepalive(Some(Duration::from_secs(2)))
-        .add_service(RuntimeServiceServer::new(runtime))
-        .add_service(ImageServiceServer::new(image))
-        .serve_with_incoming(uds_stream);
-
     let mut ctrl_c = signal(SignalKind::interrupt())?;
     let mut term = signal(SignalKind::terminate())?;
 
-    tokio::select! {
-        result = server => {
-            if let Err(error) = result {
-                error!(?error, "server returned error")
-            }
-        }
-        _ = ctrl_c.recv() => {}
-        _ = term.recv() => {}
-    };
+    Server::builder()
+        .tcp_keepalive(Some(Duration::from_secs(2)))
+        .add_service(RuntimeServiceServer::new(runtime))
+        .add_service(ImageServiceServer::new(image))
+        .serve_with_incoming_shutdown(uds_stream, async {
+            tokio::select! {
+                _ = ctrl_c.recv() => {}
+                _ = term.recv() => {}
+            };
+        })
+        .await?;
 
     info!("stopping all containers...");
 
-    engine.shutdown().iter().for_each(|(id, result)| {
+    engine.shutdown().await.iter().for_each(|(id, result)| {
         match result {
             Ok(exitcode) => {
                 let _ = storage
