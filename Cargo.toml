@@ -21,6 +21,8 @@ clap = { version = "4.5.28", features = ["derive"] }
 env_filter = "0.1.3"
 reqwest = { version = "0.12.12", default-features = false, features = ["json", "charset", "http2", "gzip", "rustls-tls"] }
 thiserror = "2.0.11"
+oci-distribution = "0.11.0"
+serde = "1.0.217"
 
 [[bin]]
 name = "test-init"

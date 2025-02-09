@@ -9,6 +9,7 @@ use nix::{
     sys::wait::{WaitPidFlag, WaitStatus},
     unistd::Pid,
 };
+use oci_distribution::client::ImageData;
 
 /// Parse "WWW-Authenticate" header format
 pub fn parse_www_authenticate(header: &str) -> Option<HashMap<String, String>> {
@@ -86,4 +87,19 @@ pub fn try_wait_pid(pid: i32) -> Option<i32> {
     }
 
     None
+}
+
+/// Get the image digest from given image
+pub fn digest_to_image_id(data: &ImageData) -> String {
+    let digest = data
+        .digest
+        .as_ref()
+        .expect("bug? oci-distribution did not return image digest");
+
+    let image_id = digest
+        .split_once(":")
+        .and_then(|(_, id)| Some(id.to_string()))
+        .unwrap_or_else(|| digest.clone());
+
+    return image_id;
 }

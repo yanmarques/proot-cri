@@ -1,5 +1,5 @@
 use std::{
-    fmt::{self, Write as FmtWrite},
+    fmt::Write as FmtWrite,
     fs::{self, File},
     io::{Read, Write as IoWrite},
     path::{Path, PathBuf},
@@ -7,16 +7,17 @@ use std::{
 };
 
 use anyhow::Context;
-use prost::{bytes::Buf, Message};
+use prost::Message;
 use rand::TryRngCore;
 
 use crate::{
     cri::runtime::{
-        Container, ContainerConfig, ContainerState, ContainerStatus, Image, ImageSpec, PodSandbox,
-        PodSandboxConfig, PodSandboxNetworkStatus, PodSandboxState, PodSandboxStatus,
+        Container, ContainerConfig, ContainerState, ContainerStatus, Image, LinuxPodSandboxStatus,
+        Namespace, NamespaceOption, PodSandbox, PodSandboxConfig, PodSandboxNetworkStatus,
+        PodSandboxState, PodSandboxStatus,
     },
     errors::StorageError,
-    utils::to_timestamp,
+    utils::{self, to_timestamp},
 };
 
 /// Generate hex string of size
@@ -28,6 +29,52 @@ pub fn random_id() -> Result<String, anyhow::Error> {
         write!(&mut hex_string, "{:02x}", byte)?;
     }
     Ok(hex_string)
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ContainerInfo {
+    #[prost(string)]
+    pub pod_sandbox_id: String,
+    #[prost(message)]
+    pub config: Option<ContainerConfig>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct PodSandboxInfo {
+    #[prost(message)]
+    pub config: Option<PodSandboxConfig>,
+    #[prost(enumeration = "PodSandboxState")]
+    pub state: i32,
+}
+
+#[derive(Clone, PartialEq, prost::Message, serde::Deserialize)]
+pub struct BuildConfig {
+    #[serde(rename = "Entrypoint")]
+    #[serde(default)]
+    #[prost(string, repeated)]
+    pub entrypoint: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[serde(rename = "Cmd")]
+    #[serde(default)]
+    #[prost(string, repeated)]
+    pub args: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[serde(rename = "Env")]
+    #[serde(default)]
+    #[prost(string, repeated)]
+    pub env: prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[serde(rename = "WorkingDir")]
+    #[serde(default)]
+    #[prost(string)]
+    pub working_dir: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ImageInfo {
+    #[prost(message)]
+    pub image: Option<Image>,
+    #[prost(bytes = "vec")]
+    pub raw_info: prost::alloc::vec::Vec<u8>,
+    #[prost(message)]
+    pub build_config: Option<BuildConfig>,
 }
 
 /// Image layer
@@ -166,7 +213,8 @@ impl Storage {
                         .expect("bug? container name has invalid chars")
                         .to_string();
 
-                    let config = self.get_container_config(&id)?;
+                    let data = self.get_container_config(&id)?;
+                    let config = data.config.expect("bug? container data has missing config");
 
                     let (state, created) = self.lookup_container_state_and_created_at(&path)?;
 
@@ -174,6 +222,7 @@ impl Storage {
 
                     let container = Container {
                         id,
+                        pod_sandbox_id: data.pod_sandbox_id,
                         image: image.clone(),
                         state: state.into(),
                         created_at: created,
@@ -183,7 +232,6 @@ impl Storage {
                         metadata: config.metadata,
                         labels: config.labels,
                         annotations: config.annotations,
-                        pod_sandbox_id: String::new(),
                     };
 
                     containers.push(container);
@@ -218,13 +266,22 @@ impl Storage {
     }
 
     /// add new container
-    pub fn add_container(&self, container: &ContainerConfig) -> Result<String, anyhow::Error> {
+    pub fn add_container(
+        &self,
+        container: &ContainerConfig,
+        pod_sandbox_id: &String,
+    ) -> Result<String, anyhow::Error> {
         let id = random_id()?;
         let root = self.containers.join(&id);
 
         if !root.exists() {
             fs::create_dir_all(&root)?;
         }
+
+        let container = ContainerInfo {
+            config: Some(container.clone()),
+            pod_sandbox_id: pod_sandbox_id.clone(),
+        };
 
         let mut buf = vec![];
         container.encode(&mut buf)?;
@@ -252,14 +309,15 @@ impl Storage {
     pub fn get_container_status(
         &self,
         id: &String,
-    ) -> Result<Option<ContainerStatus>, anyhow::Error> {
+    ) -> Result<(String, Option<ContainerStatus>), anyhow::Error> {
         let root = self.build_container_path(id);
 
         if !root.exists() {
             return Err(anyhow::anyhow!(StorageError::ContainerNotFound(id.clone())));
         }
 
-        let config = self.get_container_config(id)?;
+        let data = self.get_container_config(id)?;
+        let config = data.config.expect("bug? container data has missing config");
 
         let (state, created) = self.lookup_container_state_and_created_at(&root)?;
 
@@ -296,12 +354,12 @@ impl Storage {
             reason: String::new(),
         };
 
-        Ok(Some(status))
+        Ok((data.pod_sandbox_id, Some(status)))
     }
 
     /// Get underlying container config. Returns error if given container does not exists.
-    pub fn get_container_config(&self, id: &String) -> Result<ContainerConfig, anyhow::Error> {
-        let path = self.containers.join(id);
+    pub fn get_container_config(&self, id: &String) -> Result<ContainerInfo, anyhow::Error> {
+        let path = self.build_container_path(id);
 
         // TODO: optimize memory allocations
         let mut buf: Vec<u8> = vec![];
@@ -310,10 +368,10 @@ impl Storage {
             File::open(path.join("spec.bin")).context(format!("opening spec at {:?}", &path))?;
         file.read_to_end(&mut buf)?;
 
-        let config: ContainerConfig =
+        let data: ContainerInfo =
             prost::Message::decode(&buf[..]).context(format!("decode container {:?}", &path))?;
 
-        Ok(config)
+        Ok(data)
     }
 
     /// Delete all files associated with given container ID if it exists. If the container does not
@@ -357,33 +415,32 @@ impl Storage {
     }
 
     /// Find and return existing image. If image does not exist, returns `None`.
-    pub fn get_image(&self, digest: &String) -> Result<Option<Image>, anyhow::Error> {
-        let path = self.build_path_to_image(digest);
+    pub fn get_image(&self, image_id: &String) -> Result<Option<ImageInfo>, anyhow::Error> {
+        let path = self.build_path_to_image(image_id);
 
         if !path.exists() {
             return Ok(None);
         }
 
         let buf = fs::read(path.join("image.bin"))?;
-        let image: Image = prost::Message::decode(&buf[..])?;
+        let image: ImageInfo = prost::Message::decode(&buf[..])?;
 
         Ok(Some(image))
     }
 
-    /// check whether the layer exists
-    pub fn has_image_layer(&self, layer: &ImageLayer) -> bool {
+    /// Return whether image layer exists by the layer digest
+    pub fn has_image_layer(&self, layer: &String) -> bool {
         let layer_dir = self.build_image_layer_path(layer);
 
-        layer_dir.exists()
+        layer_dir.exists() && layer_dir.join("layer.tar.gz").exists()
     }
 
     // add image layer, overwriting existing if needed
     pub fn add_image_layer(
         &self,
-        layer: &ImageLayer,
-        buffer: impl Buf,
+        layer: &oci_distribution::client::ImageLayer,
     ) -> Result<(), anyhow::Error> {
-        let layer_path = self.build_image_layer_path(layer);
+        let layer_path = self.build_image_layer_path(&layer.sha256_digest());
         let parent = layer_path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("bug: it should have a parent here"))?;
@@ -393,7 +450,7 @@ impl Storage {
         }
 
         let mut file = File::create(layer_path)?;
-        file.write_all(buffer.chunk())?;
+        file.write_all(&layer.data)?;
         Ok(())
     }
 
@@ -401,24 +458,32 @@ impl Storage {
     /// Returns `Ok(true)` if image already exists, and do not overwrite it.
     pub fn add_image(
         &self,
-        digest: &String,
-        image: &RemoteImage,
-        layers: &[ImageLayer],
-    ) -> Result<bool, anyhow::Error> {
-        let root = self.build_path_to_image(&digest);
-        let image_layers_path = self.build_path_to_image_layers(&digest);
+        image: oci_distribution::Reference,
+        data: oci_distribution::client::ImageData,
+    ) -> Result<String, anyhow::Error> {
+        let image_id = utils::digest_to_image_id(&data);
+
+        let root = self.build_path_to_image(&image_id);
+        let image_layers_path = self.build_path_to_image_layers(&image_id);
 
         if root.exists() {
-            return Ok(true);
+            anyhow::bail!("image already exits");
         }
 
         fs::create_dir_all(&image_layers_path)?;
 
-        let spec = Image {
-            id: digest.clone(),
-            repo_tags: vec![image.to_string()],
-            size: 1,
-            ..Default::default()
+        let mut config = serde_json::from_slice::<serde_json::Value>(&data.config.data)?;
+        let build_config: BuildConfig = serde_json::from_value(config["config"].take())?;
+
+        let spec = ImageInfo {
+            image: Some(Image {
+                id: image_id.clone(),
+                repo_tags: vec![image.to_string()],
+                size: 1,
+                ..Default::default()
+            }),
+            raw_info: data.config.data,
+            build_config: Some(build_config),
         };
 
         let mut buf = vec![];
@@ -428,12 +493,12 @@ impl Storage {
         file.write_all(&buf)?;
         drop(file);
 
-        for (idx, layer) in layers.iter().enumerate() {
+        for (idx, layer) in data.layers.iter().enumerate() {
             let mut file = File::create(image_layers_path.join(idx.to_string()))?;
-            file.write_all(layer.digest.as_bytes())?;
+            file.write_all(layer.sha256_digest().as_bytes())?;
         }
 
-        Ok(false)
+        Ok(image_id)
     }
 
     /// Return list of all stored images.
@@ -446,9 +511,9 @@ impl Storage {
 
                 if path.is_dir() {
                     let buf = fs::read(path.join("image.bin"))?;
-                    let image: Image = prost::Message::decode(&buf[..])?;
+                    let info: ImageInfo = prost::Message::decode(&buf[..])?;
 
-                    images.push(image);
+                    images.push(info.image.expect("bug? stored incomplete image"));
                 }
             }
         }
@@ -466,10 +531,10 @@ impl Storage {
     }
 
     // get path to all images layers used by given image
-    pub fn image_layers(&self, digest: &String) -> Result<Vec<PathBuf>, anyhow::Error> {
-        let root = self.build_path_to_image_layers(digest);
+    pub fn image_layers(&self, image_id: &String) -> Result<Vec<PathBuf>, anyhow::Error> {
+        let root = self.build_path_to_image_layers(image_id);
         if !root.exists() {
-            return Err(anyhow::anyhow!("unknown image: {digest:?}"));
+            return Err(anyhow::anyhow!("unknown image: {image_id:?}"));
         }
 
         let mut entries = vec![];
@@ -482,7 +547,7 @@ impl Storage {
                     file.read_to_end(&mut buf)?;
 
                     let digest = String::from_utf8(buf)?;
-                    let layer = self.build_image_layer_path(&ImageLayer { digest, size: 0 });
+                    let layer = self.build_image_layer_path(&digest);
 
                     let idx: u64 = path
                         .file_name()
@@ -524,14 +589,16 @@ impl Storage {
                         .context(format!("opening spec at {:?}", &path))?;
                     file.read_to_end(&mut buf)?;
 
-                    let config: PodSandboxConfig = prost::Message::decode(&buf[..])
+                    let info: PodSandboxInfo = prost::Message::decode(&buf[..])
                         .context(format!("decode podsandbox {:?}", &path))?;
+
+                    let config = info.config.expect("bug? pod sandbox info missing config");
 
                     let created = to_timestamp(path.metadata()?.created()?)?;
 
                     let pod = PodSandbox {
                         id,
-                        state: PodSandboxState::SandboxReady.into(),
+                        state: info.state.into(),
                         labels: config.labels,
                         metadata: config.metadata,
                         annotations: config.annotations,
@@ -557,8 +624,10 @@ impl Storage {
             File::open(path.join("spec.bin")).context(format!("opening spec at {:?}", &path))?;
         file.read_to_end(&mut buf)?;
 
-        let config: PodSandboxConfig =
+        let info: PodSandboxInfo =
             prost::Message::decode(&buf[..]).context(format!("decode podsandbox {:?}", &path))?;
+
+        let config = info.config.expect("bug? pod sandbox info missing config");
 
         let created = to_timestamp(
             path.metadata()?
@@ -572,11 +641,20 @@ impl Storage {
             labels: config.labels,
             metadata: config.metadata,
             created_at: created,
-            state: PodSandboxState::SandboxReady.into(),
-            network: Some(PodSandboxNetworkStatus {
-                ip: "10.137.0.91".to_string(),
-                ..Default::default()
+            state: info.state.into(),
+            linux: Some(LinuxPodSandboxStatus {
+                namespaces: Some(Namespace {
+                    options: Some(NamespaceOption {
+                        // TODO: change this accordingly
+                        // host-network mode
+                        network: 2,
+                        pid: 0,
+                        ipc: 0,
+                        ..Default::default()
+                    }),
+                }),
             }),
+            network: Some(PodSandboxNetworkStatus::default()),
             ..Default::default()
         };
 
@@ -584,7 +662,7 @@ impl Storage {
     }
 
     /// add pod sandbox
-    pub fn add_pod_sandbox(&self, pod: &PodSandboxConfig) -> Result<String, anyhow::Error> {
+    pub fn add_pod_sandbox(&self, pod: PodSandboxConfig) -> Result<String, anyhow::Error> {
         let id = random_id()?;
         let root = self.pods.join(&id);
 
@@ -592,13 +670,56 @@ impl Storage {
             fs::create_dir_all(&root)?;
         }
 
+        let info = PodSandboxInfo {
+            config: Some(pod),
+            state: PodSandboxState::SandboxReady.into(),
+        };
+
         let mut buf = vec![];
-        pod.encode(&mut buf)?;
+        info.encode(&mut buf)?;
 
         let mut file = File::create(root.join("spec.bin"))?;
         file.write_all(&buf)?;
 
         Ok(id)
+    }
+
+    /// Change the state of the pod sandbox to not ready
+    pub fn stop_pod_sandbox(&self, pod_id: &String) -> Result<(), anyhow::Error> {
+        let path = self.pods.join(&pod_id);
+
+        if !path.exists() {
+            anyhow::bail!("unknown pod sandbox")
+        }
+
+        // TODO: optimize memory allocations
+        let mut buf: Vec<u8> = vec![];
+
+        let mut file =
+            File::open(path.join("spec.bin")).context(format!("opening spec at {:?}", &path))?;
+        file.read_to_end(&mut buf)?;
+
+        let mut info: PodSandboxInfo =
+            prost::Message::decode(&buf[..]).context(format!("decode podsandbox {:?}", &path))?;
+
+        info.state = PodSandboxState::SandboxNotready.into();
+
+        let mut buf = vec![];
+        info.encode(&mut buf)?;
+
+        let mut file = File::create(path.join("spec.bin"))?;
+        file.write_all(&buf)?;
+
+        Ok(())
+    }
+
+    /// Remove the pod sandbox from the storage.
+    /// TODO: sanity checks: can I remove all containers? etc.
+    pub fn remove_pod_sandbox(&self, pod: &String) -> Result<(), anyhow::Error> {
+        // TODO: remove dependent containers
+        let root = self.pods.join(&pod);
+
+        Ok(fs::remove_dir_all(&root)?)
     }
 
     /// Build the file system path to the given image digest.
@@ -621,7 +742,7 @@ impl Storage {
 
     /// Build path to the given image layer. An image layer is a global file,
     /// where all dependent images are associated.
-    pub fn build_image_layer_path(&self, layer: &ImageLayer) -> PathBuf {
-        self.layers.join(&layer.digest).join("layer.tar.gz")
+    pub fn build_image_layer_path(&self, layer: &String) -> PathBuf {
+        self.layers.join(layer).join("layer.tar.gz")
     }
 }
