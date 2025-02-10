@@ -9,6 +9,7 @@ use std::{
 use anyhow::Context;
 use prost::Message;
 use rand::TryRngCore;
+use serde::{de::Deserializer, Deserialize};
 
 use crate::{
     cri::runtime::{
@@ -37,6 +38,8 @@ pub struct ContainerInfo {
     pub pod_sandbox_id: String,
     #[prost(message)]
     pub config: Option<ContainerConfig>,
+    #[prost(int64)]
+    pub created_at: i64,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -45,26 +48,37 @@ pub struct PodSandboxInfo {
     pub config: Option<PodSandboxConfig>,
     #[prost(enumeration = "PodSandboxState")]
     pub state: i32,
+    #[prost(int64)]
+    pub created_at: i64,
 }
 
 #[derive(Clone, PartialEq, prost::Message, serde::Deserialize)]
 pub struct BuildConfig {
     #[serde(rename = "Entrypoint")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     #[prost(string, repeated)]
-    pub entrypoint: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    pub entrypoint: prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[serde(rename = "Cmd")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     #[prost(string, repeated)]
     pub args: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[serde(rename = "Env")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     #[prost(string, repeated)]
     pub env: prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[serde(rename = "WorkingDir")]
     #[serde(default)]
-    #[prost(string)]
-    pub working_dir: String,
+    #[prost(string, optional)]
+    pub working_dir: Option<String>,
+}
+
+/// Custom function to convert `null` to an empty Vec<String>
+fn deserialize_null_as_empty_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<Vec<String>>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default()) // Convert `None` (null) to `vec![]`
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -214,9 +228,11 @@ impl Storage {
                         .to_string();
 
                     let data = self.get_container_config(&id)?;
-                    let config = data.config.expect("bug? container data has missing config");
 
-                    let (state, created) = self.lookup_container_state_and_created_at(&path)?;
+                    let (state, created) =
+                        self.lookup_container_state_and_created_at(&path, &data)?;
+
+                    let config = data.config.expect("bug? container data has missing config");
 
                     let image = config.image.clone();
 
@@ -245,6 +261,7 @@ impl Storage {
     fn lookup_container_state_and_created_at(
         &self,
         path_to_container: &PathBuf,
+        info: &ContainerInfo,
     ) -> Result<(ContainerState, i64), anyhow::Error> {
         let mut state = ContainerState::ContainerUnknown;
 
@@ -257,12 +274,9 @@ impl Storage {
         }
 
         // TODO: rust android does not support creation time at the time
-        let created = path_to_container
-            .metadata()?
-            .created()
-            .unwrap_or_else(|_| SystemTime::now());
+        let created = info.created_at;
 
-        Ok((state, to_timestamp(created)?))
+        Ok((state, created))
     }
 
     /// add new container
@@ -281,6 +295,7 @@ impl Storage {
         let container = ContainerInfo {
             config: Some(container.clone()),
             pod_sandbox_id: pod_sandbox_id.clone(),
+            created_at: utils::timestamp()?,
         };
 
         let mut buf = vec![];
@@ -317,9 +332,9 @@ impl Storage {
         }
 
         let data = self.get_container_config(id)?;
-        let config = data.config.expect("bug? container data has missing config");
+        let (state, created) = self.lookup_container_state_and_created_at(&root, &data)?;
 
-        let (state, created) = self.lookup_container_state_and_created_at(&root)?;
+        let config = data.config.expect("bug? container data has missing config");
 
         let exitcode_path = root.join("exitcode");
         let mut exit_code = 0;
@@ -438,7 +453,7 @@ impl Storage {
     // add image layer, overwriting existing if needed
     pub fn add_image_layer(
         &self,
-        layer: &oci_distribution::client::ImageLayer,
+        layer: &oci_client::client::ImageLayer,
     ) -> Result<(), anyhow::Error> {
         let layer_path = self.build_image_layer_path(&layer.sha256_digest());
         let parent = layer_path
@@ -458,8 +473,8 @@ impl Storage {
     /// Returns `Ok(true)` if image already exists, and do not overwrite it.
     pub fn add_image(
         &self,
-        image: oci_distribution::Reference,
-        data: oci_distribution::client::ImageData,
+        image: oci_client::Reference,
+        data: oci_client::client::ImageData,
     ) -> Result<String, anyhow::Error> {
         let image_id = utils::digest_to_image_id(&data);
 
@@ -473,7 +488,9 @@ impl Storage {
         fs::create_dir_all(&image_layers_path)?;
 
         let mut config = serde_json::from_slice::<serde_json::Value>(&data.config.data)?;
-        let build_config: BuildConfig = serde_json::from_value(config["config"].take())?;
+        let raw = config["config"].take();
+        tracing::info!(?raw, "config raw");
+        let build_config: BuildConfig = serde_json::from_value(raw)?;
 
         let spec = ImageInfo {
             image: Some(Image {
@@ -594,15 +611,13 @@ impl Storage {
 
                     let config = info.config.expect("bug? pod sandbox info missing config");
 
-                    let created = to_timestamp(path.metadata()?.created()?)?;
-
                     let pod = PodSandbox {
                         id,
                         state: info.state.into(),
                         labels: config.labels,
                         metadata: config.metadata,
                         annotations: config.annotations,
-                        created_at: created,
+                        created_at: info.created_at.into(),
                         runtime_handler: "".to_string(),
                     };
 
@@ -627,31 +642,25 @@ impl Storage {
         let info: PodSandboxInfo =
             prost::Message::decode(&buf[..]).context(format!("decode podsandbox {:?}", &path))?;
 
-        let config = info.config.expect("bug? pod sandbox info missing config");
+        let ns_options = info
+            .config
+            .clone()
+            .and_then(|c| c.linux)
+            .and_then(|l| l.security_context)
+            .and_then(|s| s.namespace_options);
 
-        let created = to_timestamp(
-            path.metadata()?
-                .created()
-                .unwrap_or_else(|_| SystemTime::now()),
-        )?;
+        let config = info.config.expect("bug? pod sandbox info missing config");
 
         let status = PodSandboxStatus {
             id: id.clone(),
             annotations: config.annotations,
             labels: config.labels,
             metadata: config.metadata,
-            created_at: created,
+            created_at: info.created_at,
             state: info.state.into(),
             linux: Some(LinuxPodSandboxStatus {
                 namespaces: Some(Namespace {
-                    options: Some(NamespaceOption {
-                        // TODO: change this accordingly
-                        // host-network mode
-                        network: 2,
-                        pid: 0,
-                        ipc: 0,
-                        ..Default::default()
-                    }),
+                    options: ns_options,
                 }),
             }),
             network: Some(PodSandboxNetworkStatus::default()),
@@ -673,6 +682,7 @@ impl Storage {
         let info = PodSandboxInfo {
             config: Some(pod),
             state: PodSandboxState::SandboxReady.into(),
+            created_at: utils::timestamp()?,
         };
 
         let mut buf = vec![];

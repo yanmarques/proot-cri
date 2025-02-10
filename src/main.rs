@@ -631,16 +631,16 @@ impl ImageService for ImageHandler {
         // }
         //
         let reference =
-            oci_distribution::Reference::try_from(reference.image.clone()).map_err(|error| {
+            oci_client::Reference::try_from(reference.image.clone()).map_err(|error| {
                 error!(?error, ?reference, "failed to parse image reference");
                 Status::invalid_argument("image")
             })?;
 
-        let client = oci_distribution::Client::default();
+        let client = oci_client::Client::default();
         let image = client
             .pull(
                 &reference,
-                &oci_distribution::secrets::RegistryAuth::Anonymous,
+                &oci_client::secrets::RegistryAuth::Anonymous,
                 vec![
                     "application/vnd.oci.image.layer.v1.tar+gzip",
                     "application/vnd.docker.image.rootfs.diff.tar.gzip",
@@ -938,12 +938,30 @@ impl RuntimeService for RuntimeHandler {
         // );
 
         // info!("{{\"sandboxID\":\"{}\",\"config\":{{\"runtimeSpec\":{{\"annotations\":{{\"io.kubernetes.cri.sandbox-id\":\"{}\"}}}}}}}}", pod_sandbox_id, pod_sandbox_id);
+        let cmd_json =
+            serde_json::to_string(&info.config.as_ref().and_then(|c| Some(c.command.clone())))
+                .unwrap_or_else(|_| String::new());
+        let args_json =
+            serde_json::to_string(&info.config.as_ref().and_then(|c| Some(c.args.clone())))
+                .unwrap_or_else(|_| String::new());
+        let env_json = serde_json::to_string(&info.config.as_ref().and_then(|c| {
+            Some(
+                c.envs
+                    .clone()
+                    .iter()
+                    .map(|e| format!("{}={}", e.key, e.value))
+                    .collect::<Vec<_>>(),
+            )
+        }))
+        .unwrap_or_else(|_| String::new());
+
         let reply = ContainerStatusResponse {
             status,
-            ..Default::default() // info: HashMap::from([(
-                                 //     "info".to_string(),
-                                 //     format!("{{\"sandboxID\":\"{}\",\"config\":{{\"runtimeSpec\":{{\"annotations\":{{\"io.kubernetes.cri.sandbox-id\":\"{}\"}}}}}}}}}}", pod_sandbox_id, pod_sandbox_id),
-                                 // )]),
+            info: HashMap::from([
+                ("command".to_string(), cmd_json.to_string()),
+                ("env".to_string(), env_json.to_string()),
+                ("args".to_string(), args_json.to_string()),
+            ]),
         };
 
         Ok(Response::new(reply))
@@ -1122,7 +1140,9 @@ impl RuntimeService for RuntimeHandler {
 
         // use image default build configuration when container does not provide one
         if config.working_dir == "" {
-            config.working_dir = build_config.working_dir.clone();
+            if let Some(cwd) = build_config.working_dir {
+                config.working_dir = cwd.clone();
+            }
         }
 
         if config.command.is_empty() {
@@ -1133,12 +1153,15 @@ impl RuntimeService for RuntimeHandler {
             config.args = build_config.args.clone();
         }
 
-        if config.envs.is_empty() && build_config.env.is_empty() {
-            for env in build_config.env.iter() {
-                let (key, value) = env
-                    .split_once("=")
-                    .expect("bug? image has wrong environment");
+        // TODO: image environment vars during image pull, not here
+        for env in build_config.env.iter() {
+            let (key, value) = env
+                .split_once("=")
+                .expect("bug? image has wrong environment");
 
+            // Why `config.envs` is a Vec? hell
+            // TODO: create a copy of `config.envs` to a HashMap for faster lookups
+            if !config.envs.iter().filter(|e| e.key == key).count() == 0 {
                 config.envs.push(KeyValue {
                     key: key.to_string(),
                     value: value.to_string(),

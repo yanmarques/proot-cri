@@ -9,7 +9,7 @@ use nix::{
     sys::wait::{WaitPidFlag, WaitStatus},
     unistd::Pid,
 };
-use oci_distribution::client::ImageData;
+use oci_client::client::ImageData;
 
 /// Parse "WWW-Authenticate" header format
 pub fn parse_www_authenticate(header: &str) -> Option<HashMap<String, String>> {
