@@ -27,7 +27,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "android-proot-cri"
+name = "android-cri"
 version = "0.1.0"
 dependencies = [
  "anyhow",
