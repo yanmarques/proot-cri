@@ -1,0 +1,3 @@
+[submodule "rust-oci-client"]
+	path = rust-oci-client
+	url = git@github.com:yanmarques/rust-oci-client.git
