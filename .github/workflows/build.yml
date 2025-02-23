@@ -1,0 +1,46 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets:
+          - x86_64-unknown-linux-gnu
+          - x86_64-linux-android
+          - aarch64-linux-android
+    - uses: actions/checkout@v4
+    - run: apt update && apt install -y perl
+
+    - name: Build linux amd64
+      run: cargo build --release --target=x86_64-unknown-linux-gnu
+    - uses: actions/upload-artifact@v4
+      with:
+        name: android-cri-linux-amd64
+        path: ./target/x86_64-unknown-linux-gnu/release/android-cri
+
+    - name: Build android/30 amd64
+      run: ANDROID_API=30 ARCH=x86_64 ./hack/build-android.sh --release
+    - uses: actions/upload-artifact@v4
+      with:
+        name: android-cri-android-amd64
+        path: ./target/x86_64-linux-android/release/android-cri
+
+    - name: Build android/30 arm64
+      run: ANDROID_API=30 ARCH=aarch64 ./hack/build-android.sh --release
+    - uses: actions/upload-artifact@v4
+      with:
+        name: android-cri-android-arm64
+        path: ./target/aarch64-linux-android/release/android-cri
+
