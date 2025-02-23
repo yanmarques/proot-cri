@@ -1,5 +1,5 @@
 #!/bin/sh
-set -exo pipefail
+set -ex
 IS_AARCH64=false
 ndk_ver="r27c"
 clang_ver="18"
