@@ -14,13 +14,22 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+          build/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
     - uses: dtolnay/rust-toolchain@stable
       with:
-        targets:
-          - x86_64-unknown-linux-gnu
-          - x86_64-linux-android
-          - aarch64-linux-android
-    - uses: actions/checkout@v4
+        targets: x86_64-unknown-linux-gnu,x86_64-linux-android,aarch64-linux-android
     - run: apt update && apt install -y perl
 
     - name: Build linux amd64
