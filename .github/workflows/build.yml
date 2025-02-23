@@ -30,7 +30,7 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
       with:
         targets: x86_64-unknown-linux-gnu,x86_64-linux-android,aarch64-linux-android
-    - run: apt update && apt install -y perl
+    - run: sudo apt update && sudo apt install -y perl
 
     - name: Build linux amd64
       run: cargo build --release --target=x86_64-unknown-linux-gnu
