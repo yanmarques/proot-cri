@@ -1,4 +1,4 @@
-name: Build
+name: Build binaries
 
 on:
   workflow_dispatch:
@@ -11,7 +11,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  build-linux:
+    strategy:
+      matrix:
+        target:
+          - x86_64
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -31,27 +35,55 @@ jobs:
 
     - uses: dtolnay/rust-toolchain@stable
       with:
-        targets: x86_64-unknown-linux-gnu,x86_64-linux-android,aarch64-linux-android
-    - run: sudo apt update && sudo apt install -y perl
+        targets: x86_64-unknown-linux-gnu
 
-    - name: Build linux amd64
-      run: cargo build --release --target=x86_64-unknown-linux-gnu
+    - name: Install dependencies
+      run: sudo apt update && sudo apt install -y perl
+
+    - name: Build
+      run: cargo build --release --target=${{ matrix.target }}-unknown-linux-gnu
+
     - uses: actions/upload-artifact@v4
       with:
-        name: android-cri-linux-amd64
-        path: ./target/x86_64-unknown-linux-gnu/release/android-cri
+        name: proot-cri_linux_${{ matrix.target }}
+        path: ./target/${{ matrix.target }}-unknown-linux-gnu/release/proot-cri
 
-    - name: Build android/30 amd64
-      run: ANDROID_API=30 ARCH=x86_64 ./hack/build-android.sh --release
+  build-android:
+    strategy:
+      matrix:
+        api:
+          - "30"
+        target: 
+          - x86_64
+          - aarch64
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+          build/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-linux-android,aarch64-linux-android
+
+    - name: Install dependencies
+      run: sudo apt update && sudo apt install -y perl
+
+    - name: Build
+      run: ANDROID_API=${{ matrix.api }} ARCH=${{ matrix.target }} ./hack/build-android.sh --release
+
     - uses: actions/upload-artifact@v4
       with:
-        name: android-cri-android-amd64
-        path: ./target/x86_64-linux-android/release/android-cri
-
-    - name: Build android/30 arm64
-      run: ANDROID_API=30 ARCH=aarch64 ./hack/build-android.sh --release
-    - uses: actions/upload-artifact@v4
-      with:
-        name: android-cri-android-arm64
-        path: ./target/aarch64-linux-android/release/android-cri
-
+        name: proot-cri_android${{ matrix.api }}_${{ matrix.target }}
+        path: ./target/${{ matrix.target }}-linux-android/release/proot-cri

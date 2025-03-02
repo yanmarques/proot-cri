@@ -1,5 +1,5 @@
 [package]
-name = "android-cri"
+name = "proot-cri"
 version = "0.1.0"
 edition = "2021"
 
@@ -26,6 +26,3 @@ serde = "1.0.217"
 [[bin]]
 name = "test-init"
 
-
-[build-dependencies]
-tonic-build = "*"

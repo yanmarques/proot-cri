@@ -79,7 +79,7 @@ export RUSTFLAGS="$RUSTFLAGS -L $ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux
 linker="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/$ARCH-linux-android$ANDROID_API-clang"
 
 exec cargo build \
-	--bin android-cri \
+	--bin proot-cri \
 	--target ${ARCH}-linux-android \
 	--config target."$ARCH"-linux-android.linker=\""$linker"\" \
 	$*
